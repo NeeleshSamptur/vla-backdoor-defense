@@ -215,6 +215,7 @@ conda activate GoBA-OpenVLA
 cd /home/grads/nsamptur/vla_bkd_def/GoBA_attack
 python ../vla-backdoor-defense/adapters/goba/extract_text2img_ftt.py \
     --checkpoint exp/openvla-7b+libero_goal_no_noops+b16+lr-0.0005+lora-r32+dropout-0.0--image_aug \
+    --task-suite-name libero_goal \
     --role attack --out-dir ../vla-backdoor-defense/results/goba_extracted
 python ../vla-backdoor-defense/adapters/goba/extract_text2img_ftt.py \
     --checkpoint openvla/openvla-7b-finetuned-libero-goal \

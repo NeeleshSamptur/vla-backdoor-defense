@@ -149,8 +149,17 @@ def load_vla_for_attention(cfg):
     Everything else here is copied from GoBA's get_vla verbatim -- same Auto*
     registrations, same dtype/low_cpu_mem_usage/trust_remote_code, same device
     move, same dataset_statistics.json handling for norm_stats. The attention
-    implementation changes how attention is computed, not what the weights are
-    or what the policy does.
+    implementation changes how attention is computed, not what the weights are.
+
+    DISCLOSE THIS IN THE PAPER: GoBA's published ASR/SR numbers were produced
+    under flash_attention_2. Frame 0 of every episode here is still the same
+    settled scene (deterministic given the BDDL + reset sequence), so the
+    Stage-1 statistic is measured on identical inputs. But frames 1..N-1 follow
+    actions computed under SDPA, which is numerically very close to but not
+    bit-identical with FA2 -- so these rollout trajectories are not guaranteed
+    to match a FA2 rollout step for step. That is fine for a detector (we are
+    measuring attention on the frames we actually feed it) but the write-up
+    should not claim bit-identical reproduction of GoBA eval trajectories.
     """
     print("[*] Instantiating Pretrained VLA model")
     print("[*] Loading in BF16 with SDPA attention (needed for output_attentions)")
@@ -432,7 +441,15 @@ def main():
                             extra={"role": args.role,
                                    "task_suite_name": args.task_suite_name,
                                    "eval_design": args.eval_design,
-                                   "bddl_dir": bddl_dir},
+                                   "bddl_dir": bddl_dir,
+                                   # ExtractedSample.seed carries the EPISODE
+                                   # INDEX (position in the reset sequence),
+                                   # matching badvla_white_patch where it is the
+                                   # index into the curated init-state array.
+                                   # The env-construction seed is a different
+                                   # thing and is recorded here so a table keyed
+                                   # on "seed" can't silently conflate them.
+                                   "env_seed": args.seed},
                         ).save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}"
                                              f"__t{task_id}__seed{args.seed}__s{ep_idx}"
                                              f"__{cond}__f{frame_idx}.npz"))
