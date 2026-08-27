@@ -220,8 +220,15 @@ python ../vla-backdoor-defense/adapters/goba/extract_text2img_ftt.py \
 
 # 3. Detection (attack-agnostic, no GPU, no attack repos needed)
 cd /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense
-# Stage 1 (always-on triggers)
-python runners/run_detector.py --mode static --samples-dir results/badvla_extracted --out results/ftt_badvla.json
+# BadVLA's extractor produces multi-frame episodes (n_frames closed-loop
+# passes each) -- use --mode stage1, which groups by episode_id and averages
+# FTT over the leading frames. --mode static would score every frame as an
+# independent sample with no per-episode averaging, silently defeating the
+# point of Stage 1. GoBA's extractor is still single-frame (no closed-loop
+# rollout, no episode_id set), so --mode static is correct there as-is --
+# these are not interchangeable, pick per extractor, not by habit.
+python runners/run_detector.py --mode stage1 --n-frames 5 \
+    --samples-dir results/badvla_white_patch_extracted --out results/ftt_badvla_stage1.json
 python runners/run_detector.py --mode static --samples-dir results/goba_extracted   --out results/ftt_goba.json
 
 # Stage 2 (delayed triggers; needs per-frame samples with episode_id/frame_idx)

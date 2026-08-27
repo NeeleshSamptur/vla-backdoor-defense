@@ -89,4 +89,13 @@ done
 echo
 echo "Done. Extracted samples -> ${OUT_DIR}"
 echo "Run detection with:"
-echo "  cd ${DEFENSE} && python runners/run_detector.py --mode static --samples-dir ${OUT_DIR}"
+# NOT --mode static: this extractor's episodes are multi-frame (n_frames
+# passes each), and static scores every frame independently with no
+# per-episode averaging or grouping -- it silently ignores the whole point
+# of Stage 1's within-episode averaging. --mode stage1 groups by episode_id,
+# averages FTT over the leading N_FRAMES passes, and prints/saves the
+# per-sample avg_ftt values. Keep this in sync with N_FRAMES above if it
+# changes; the two can silently drift the same way --eval-design's defaults
+# once did.
+echo "  cd ${DEFENSE} && python runners/run_detector.py --mode stage1 --n-frames ${N_FRAMES:-5} \\"
+echo "      --samples-dir ${OUT_DIR} --out results/ftt_badvla_stage1.json"
