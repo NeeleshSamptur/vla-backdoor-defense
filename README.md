@@ -95,13 +95,47 @@ trigger. The two stages cover different threats rather than double-counting.
   visible. Requiring `k` consecutive elevated frames filters one-frame blips
   (motion blur, specular highlights) but cannot filter a real activation.
 
+### Closing the early-activation hole (`detectors/cascade.py`)
+
+Self-normalizing against the opening frames fails *silently* if the trigger
+fires early: with a 5-frame window and activation at frame 2, three of the
+five reference frames are poisoned, the baseline drifts toward the trigger
+state, and everything after looks normal relative to it.
+
+The fix is to stop assuming the prefix is clean and instead **verify it, on
+exactly the frames that will become the baseline**:
+
+```
+Stage 1: score the first K frames against a population reference from
+         known-clean rollouts.  Any frame suspicious -> ALARM, and never
+         trust this baseline.
+Stage 2: only if Stage 1 certifies them, adopt those K frames as the
+         reference and watch for a persistent departure.
+```
+
+Because the screening window **is** the baseline window, contamination of the
+baseline is precisely what Stage 1 tests for — so there is no gap:
+
+| activation frame | first K frames | caught by |
+|---|---|---|
+| 0 … K−1 | contaminated | **Stage 1** (gate refuses) |
+| K … N | genuinely clean | **Stage 2** (departure) |
+
+`tests/test_cascade.py` sweeps the activation frame across the episode and
+asserts every one is caught by one stage or the other. It also contains
+`test_naive_baseline_DOES_fail_early_activation`, a regression test proving
+the ungated rule really does miss an early activation — the hole is real, and
+gating is what closes it.
+
 Two caveats stated up front, not buried:
 
-- **Stage 2 assumes a clean prefix.** True for DropVLA, false for
-  BadVLA/GoBA. Stage 1's real job in the cascade is to *certify the baseline*,
-  so Stage 2's reliability is bounded by Stage 1's false-negative rate.
-- **An adaptive attacker can fire at frame 0** to erase the clean prefix — at
-  the cost of having nothing grasped to drop.
+- **Stage 1 needs a small population reference** from clean rollouts to judge
+  "is this window clean in absolute terms." That's realistic — the defender
+  can run clean episodes — and it's used only for the gate, but it is a real
+  external dependency that Stage 2 alone does not have.
+- **Stage 2's reliability is bounded by Stage 1's false-negative rate.** A
+  missed contaminated prefix still poisons the baseline. The cascade makes
+  that dependency explicit and measurable rather than assumed.
 
 ### Metrics beyond AUROC
 

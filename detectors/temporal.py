@@ -182,3 +182,64 @@ def summarize_episodes(episodes, cfg: Optional[TemporalConfig] = None) -> dict:
         "mean_latency_frames": float(np.mean(latencies)) if latencies else float("nan"),
         "n_latency_samples": len(latencies),
     }
+
+
+# ---------------------------------------------------------------------------
+# Change-point scan: no assumption about WHICH part of the episode is clean
+# ---------------------------------------------------------------------------
+
+def changepoint_scan(scores: Sequence[float], min_seg: int = 4) -> dict:
+    """Find the split point that best separates the episode into two regimes.
+
+    Motivation: `relative_trace`/`first_alarm_frame` assume the opening frames
+    are clean. That breaks if the trigger fires early -- with n_baseline=8 and
+    activation at frame 2, six of the eight reference frames are already
+    poisoned, the baseline becomes the TRIGGER state, and later frames look
+    normal relative to it. A silent failure.
+
+    This makes no such assumption. For every candidate split tau it compares
+    the prefix [0, tau) against the suffix [tau, N) and keeps the sharpest
+    separation. Activation at frame 5, 30 or 200 is handled identically, and
+    tau_hat estimates when it happened.
+
+    Separation is measured by the Mann-Whitney U statistic (equivalently, the
+    AUC of prefix-vs-suffix): fully nonparametric, bounded in [0, 1], and
+    insensitive to FTT's absolute scale. Oriented so HIGHER = more suspicious,
+    matching `relative_trace` (FTT drops when assimilation kicks in, so a
+    suspicious split is one where the suffix sits below the prefix).
+
+    NOTE this is a RETROSPECTIVE test -- it needs the whole episode. Use it for
+    episode-level AUROC. For latency and for live intervention you still want
+    the online rule (`first_alarm_frame`), which alarms as evidence arrives.
+
+    Returns {"score": separation in [0,1], "tau_hat": estimated activation}.
+    A trigger present from frame 0 has no change point at all and will score
+    near chance here -- that case is Stage 1's job, not this one.
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    n = s.size
+    if n < 2 * min_seg:
+        return {"score": float("nan"), "tau_hat": None}
+
+    best_score, best_tau = -np.inf, None
+    for tau in range(min_seg, n - min_seg + 1):
+        pre, post = s[:tau], s[tau:]
+        # Fraction of (pre, post) pairs where pre > post == AUC of the split.
+        # Ties count as 0.5, exactly as Mann-Whitney prescribes.
+        diff = pre[:, None] - post[None, :]
+        u = (diff > 0).sum() + 0.5 * (diff == 0).sum()
+        auc = u / (pre.size * post.size)
+        if auc > best_score:
+            best_score, best_tau = auc, tau
+
+    return {"score": float(best_score), "tau_hat": int(best_tau)}
+
+
+def episode_score_robust(scores: Sequence[float], cfg: Optional[TemporalConfig] = None,
+                         min_seg: int = 4) -> float:
+    """Episode-level score that survives an early-firing trigger.
+
+    Drop-in alternative to `episode_score` for computing episode AUROC when
+    you cannot assume the episode opens clean.
+    """
+    return changepoint_scan(scores, min_seg=min_seg)["score"]
