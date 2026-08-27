@@ -199,15 +199,14 @@ Adapters produce this. Detectors only ever consume it.
 ## Running today's two attacks
 
 ```bash
-# 1. BadVLA extraction (its own env; OFT checkpoint, 2 cameras + proprio)
-conda activate <BadVLA's env>
-cd /home/grads/nsamptur/vla_bkd_def/BadVLA
-python ../vla-backdoor-defense/adapters/badvla/extract_text2img_ftt.py \
-    --checkpoint vla-scripts/goal_block/trigger_sec/goal_block_stage2_30000_chkpt \
-    --role attack --out-dir ../vla-backdoor-defense/results/badvla_extracted
-python ../vla-backdoor-defense/adapters/badvla/extract_text2img_ftt.py \
-    --checkpoint moojink/openvla-7b-oft-finetuned-libero-goal \
-    --role clean_baseline --out-dir ../vla-backdoor-defense/results/badvla_extracted
+# 1. BadVLA extraction (its own env; OFT checkpoint, 2 cameras + proprio).
+#    All four suites, both roles, using the exact checkpoints validated in
+#    attack_model_paths.md and the exact PYTHONPATH BadVLA's own
+#    run_libero_eval_local.sh uses (see extract_text2img_ftt.py's docstring
+#    for why this must not silently diverge -- there is no bundled BDDL fork
+#    in BadVLA; BDDL content comes purely from whichever `libero` package is
+#    first on PYTHONPATH).
+adapters/badvla/run_all_suites.sh
 
 # 2. GoBA extraction (its own env; physical toxic-box trigger)
 conda activate GoBA-OpenVLA
