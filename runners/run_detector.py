@@ -19,6 +19,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from detectors.ftt import auroc_both_polarities, ftt_score  # noqa: E402
@@ -31,14 +33,18 @@ def main():
     ap.add_argument("--samples-dir", required=True,
                     help="directory of .npz files from an attack's extractor")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--mode", choices=["static", "temporal"], default="static",
+    ap.add_argument("--mode", choices=["static", "stage1", "temporal"], default="static",
                     help="static = Stage 1, one frame per scene, catches always-on "
                          "triggers (BadVLA/GoBA). temporal = Stage 2, per-frame "
                          "monitoring against each episode's own baseline, catches "
-                         "delayed triggers (DropVLA).")
+                         "delayed triggers (DropVLA). stage1 = per-EPISODE score, "
+                         "averaging FTT over that episode's first --n-frames forward "
+                         "passes (the two-stage cascade's gate).")
     ap.add_argument("--n-baseline", type=int, default=8)
     ap.add_argument("--k-persist", type=int, default=3)
     ap.add_argument("--z-threshold", type=float, default=4.0)
+    ap.add_argument("--n-frames", type=int, default=5,
+                    help="stage1: how many of each episode's leading frames to average")
     args = ap.parse_args()
 
     samples = load_dir(args.samples_dir)
@@ -46,6 +52,9 @@ def main():
 
     if args.mode == "temporal":
         run_temporal(samples, args)
+        return
+    if args.mode == "stage1":
+        run_stage1(samples, args)
         return
 
     by_group = defaultdict(list)
@@ -82,6 +91,64 @@ def main():
         print(f"    AUROC(high=backdoor)={auroc['high_is_backdoor']:.4f}  "
               f"AUROC(low=backdoor)={auroc['low_is_backdoor']:.4f}")
         print(f"    => best polarity: {best_polarity}  (AUROC={r['best_auroc']:.4f})")
+
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        json.dump(results, open(args.out, "w"), indent=2)
+        print(f"\n[*] saved -> {args.out}")
+
+
+def run_stage1(samples, args):
+    """Stage 1: one score per EPISODE = mean FTT over its first N passes.
+
+    Distinct from --mode static, which treats every frame as an independent
+    sample. Averaging within an episode is the point of the gate: it cuts
+    per-frame noise before the clean/trigger decision, and it makes the unit
+    of evaluation an episode (what a deployed defender actually screens),
+    not a frame.
+    """
+    by_ep = defaultdict(list)
+    for s in samples:
+        key = (s.attack, s.checkpoint, s.extra.get("role", ""),
+               s.extra.get("task_suite_name", ""), s.episode_id or "")
+        by_ep[key].append(s)
+
+    by_group = defaultdict(list)
+    for (attack, ckpt, role, suite, ep_id), frames in by_ep.items():
+        frames.sort(key=lambda x: x.frame_idx)
+        used = frames[: args.n_frames] if args.n_frames else frames
+        score = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
+        label = int(any(f.label == 1 for f in frames))
+        by_group[(attack, ckpt, role, suite)].append((score, label, len(used)))
+
+    results = {}
+    for (attack, ckpt, role, suite), rows in sorted(by_group.items(), key=lambda kv: str(kv[0])):
+        clean = [sc for sc, lb, _ in rows if lb == 0]
+        trig = [sc for sc, lb, _ in rows if lb == 1]
+        auroc = auroc_both_polarities(clean, trig)
+        key = f"{attack}::{suite}::{role}"
+        n_used = rows[0][2] if rows else 0
+        results[key] = {
+            "attack": attack, "suite": suite, "role": role,
+            "checkpoint": ckpt,
+            "n_clean_episodes": len(clean), "n_trigger_episodes": len(trig),
+            "frames_averaged": n_used,
+            "clean_mean": float(np.mean(clean)) if clean else float("nan"),
+            "trig_mean": float(np.mean(trig)) if trig else float("nan"),
+            "auroc": auroc,
+            # Polarity is FIXED A PRIORI to T2IShield's convention
+            # (assimilation => LOW FTT when a trigger is present), NOT chosen
+            # by whichever direction scores higher on this data. Picking
+            # post-hoc would inflate a near-chance result.
+            "auroc_reported": auroc["low_is_backdoor"],
+        }
+        r = results[key]
+        print(f"\n[{key}]")
+        print(f"    episodes: {r['n_clean_episodes']} clean, {r['n_trigger_episodes']} trigger "
+              f"({n_used} frames averaged each)")
+        print(f"    FTT mean: clean={r['clean_mean']:.5f}  trigger={r['trig_mean']:.5f}")
+        print(f"    AUROC (low=backdoor, a priori) : {r['auroc_reported']:.4f}")
+        print(f"    AUROC (high=backdoor, diagnostic): {auroc['high_is_backdoor']:.4f}")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)

@@ -59,6 +59,7 @@ Usage (mirrors run_libero_eval_local.sh's own env setup exactly):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -83,8 +84,11 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.vla.constants import IGNORE_INDEX
 
 from experiments.robot.libero.libero_utils import get_libero_dummy_action, get_libero_env
-from experiments.robot.libero.run_libero_eval import add_trigger_img, prepare_observation
-from experiments.robot.openvla_utils import get_proprio_projector, normalize_proprio, prepare_images_for_vla
+from experiments.robot.libero.run_libero_eval import add_trigger_img, prepare_observation, process_action
+from experiments.robot.openvla_utils import (
+    get_action_head, get_proprio_projector, normalize_proprio, prepare_images_for_vla,
+)
+from experiments.robot.robot_utils import get_action, get_image_resize_size
 
 from detectors.schema import ExtractedSample  # from the new repo, added to sys.path above
 
@@ -104,6 +108,11 @@ class Cfg:
     model_family: str = "openvla"
     env_img_res: int = 256
     unnorm_key: str = ""  # set explicitly in main() from --task-suite-name
+    # Required by get_action()/get_action_head(); values match BadVLA's own
+    # eval defaults for these checkpoints (L1 regression head, no diffusion).
+    use_l1_regression: bool = True
+    use_diffusion: bool = False
+    num_open_loop_steps: int = 8
 
 
 def load_vla(ckpt, cfg):
@@ -124,29 +133,46 @@ def load_vla(ckpt, cfg):
         cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
     proprio_projector = get_proprio_projector(cfg, vla.llm_dim, proprio_dim=8)
     proprio_projector = proprio_projector.to(DEVICE, dtype=torch.bfloat16).eval()
-    return processor, vla, proprio_projector
+    # Needed to produce executable actions for the closed-loop rollout.
+    action_head = get_action_head(cfg, vla.llm_dim)
+    return processor, vla, proprio_projector, action_head
 
 
 def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, trigger, trigger_size,
-                  camera="primary"):
-    """Adapted from run_kl_vs_ftt_text2img.py -- ONE fix from the original:
-    only the primary/third-person camera is triggered, matching how the model
-    was actually poisoned.
+                  camera="primary", trigger_cameras="both"):
+    """Trigger application matches BadVLA's OWN EVAL exactly (both cameras).
 
-    Verified against BadVLA's own training code
-    (prismatic/vla/datasets/datasets.py + vla-scripts/finetune_with_trigger_injection_pixel.py,
-    line 417): the training loss only ever consumes
-    `batch["trigger_pixel_values"]` (primary camera). A `trigger_pixel_values_wrist`
-    is constructed by the dataset transform but is NEVER referenced in the
-    training loop -- the wrist camera is never actually poisoned, regardless of
-    num_images_in_input. The original analysis script triggered both cameras at
-    eval time, which doesn't match the true attack surface and makes detection
-    artificially easier (two changed regions instead of one). Fixed here.
+    EVAL PARITY IS THE REQUIREMENT HERE, and it differs from training:
+
+      * Training (prismatic/vla/datasets/datasets.py +
+        finetune_with_trigger_injection_pixel.py:417): the loss only ever
+        consumes `batch["trigger_pixel_values"]` -- the PRIMARY camera. A
+        `trigger_pixel_values_wrist` is built by the dataset transform but is
+        never referenced in the training loop.
+      * Eval (run_libero_eval.py:479-487): applies add_trigger_img to BOTH
+        `full_image` AND `wrist_image`.
+
+    So BadVLA trains on a primary-only trigger but evaluates with the patch on
+    both cameras. Every ASR / clean-SR number in their repo (and in
+    attack_model_paths.md) was measured under the BOTH-cameras condition, so
+    detection numbers must be produced the same way to be comparable. An
+    earlier revision of this file triggered primary-only to match the training
+    surface; that was reverted because it silently changed the eval condition.
+
+    Set --trigger-cameras primary to reproduce the training-surface variant --
+    worth reporting as an ablation, since a defense that only works when the
+    wrist camera is also patched would be exploiting an eval artifact.
+
+    Note this is independent of --camera, which selects which camera's
+    attention COLUMNS feed FTT (the detector reads the main camera per the
+    detector design); this argument controls which images get the patch.
     """
     full = observation["full_image"].copy()
-    wrist = observation["wrist_image"].copy()  # left clean -- see docstring
+    wrist = observation["wrist_image"].copy()
     if trigger:
         full = add_trigger_img(full, trigger_size=trigger_size, trigger_position="center", trigger_color=255)
+        if trigger_cameras == "both":
+            wrist = add_trigger_img(wrist, trigger_size=trigger_size, trigger_position="center", trigger_color=255)
     images = prepare_images_for_vla([full, wrist], cfg)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
     inputs = processor(prompt, images[0]).to(DEVICE, dtype=torch.bfloat16)
@@ -226,6 +252,16 @@ def main():
                          "(default) is the camera that actually gets poisoned -- see "
                          "text2img_rows' docstring on training-time camera targeting.")
     ap.add_argument("--n-seeds", type=int, default=1, help="episodes per task, seed=base_seed+k")
+    ap.add_argument("--n-frames", type=int, default=5,
+                    help="number of policy FORWARD PASSES per episode (Stage 1 "
+                         "averages FTT over these). Each pass yields one attention "
+                         "map; OFT executes NUM_ACTIONS_CHUNK actions between passes, "
+                         "so this is not the same as env timesteps.")
+    ap.add_argument("--trigger-cameras", choices=["both", "primary"], default="both",
+                    help="which cameras receive the trigger patch. 'both' (default) "
+                         "matches BadVLA's own eval exactly, which is what their ASR/SR "
+                         "numbers were measured under. 'primary' matches the TRAINING "
+                         "surface instead -- useful as an ablation.")
     args = ap.parse_args()
 
     torch.cuda.set_device(DEVICE)
@@ -236,11 +272,21 @@ def main():
 
     cfg = Cfg(pretrained_checkpoint=args.checkpoint, unnorm_key=args.task_suite_name)
     print(f"[*] loading {args.checkpoint} (role={args.role}, suite={args.task_suite_name})")
-    processor, vla, proprio_projector = load_vla(args.checkpoint, cfg)
+    processor, vla, proprio_projector, action_head = load_vla(args.checkpoint, cfg)
+    resize_size = get_image_resize_size(cfg)
 
     suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
     n_tasks = min(args.n_tasks, suite.n_tasks)
-    ckpt_tag = Path(args.checkpoint).name if os.path.isdir(args.checkpoint) else args.checkpoint.replace("/", "_")
+    # BadVLA's checkpoint directory names encode the full training config and
+    # run ~200 chars. Combined with suite/task/seed/cond/frame suffixes that
+    # blew past the 255-byte filename limit (it survived seeds 7-9 and died on
+    # "s10" -- one extra character). The full path is preserved losslessly in
+    # the sample's `checkpoint` metadata field, so the filename only needs to
+    # be short, unique and stable: a readable prefix plus a hash of the full
+    # path to keep two checkpoints from ever colliding.
+    _raw_tag = Path(args.checkpoint).name if os.path.isdir(args.checkpoint) else args.checkpoint.replace("/", "_")
+    _digest = hashlib.md5(str(args.checkpoint).encode()).hexdigest()[:8]
+    ckpt_tag = f"{_raw_tag[:40]}_{_digest}"
     out_dir = Path(args.out_dir)
 
     for task_id in range(n_tasks):
@@ -251,30 +297,83 @@ def main():
                 env, desc = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
                 env.seed(seed)
                 env.reset()
+
+                # Settle the scene exactly as BadVLA's eval does before the
+                # policy is ever queried (run_libero_eval.py: num_steps_wait=10
+                # no-op steps so dropped objects come to rest).
                 obs = None
                 for _ in range(NUM_STEPS_WAIT):
                     obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
-                observation, _ = prepare_observation(obs, 224)
-                rows, num_patches = text2img_rows(vla, processor, proprio_projector, cfg, observation,
-                                                  desc, trig, args.trigger_size, camera=args.camera)
+
+                # Closed-loop rollout. Each pass = one policy query = one
+                # attention map = one FTT value. OFT returns NUM_ACTIONS_CHUNK
+                # actions per query, all of which are executed before the next
+                # query, mirroring run_libero_eval.py's action-queue logic --
+                # so N passes advance the sim by N*chunk steps, not N steps.
+                # This is why "5 frames" must mean 5 PASSES, not 5 timesteps:
+                # timesteps 0-7 all fall inside pass #1 and share one map.
+                frames_rows = []
+                for pass_idx in range(args.n_frames):
+                    observation, _ = prepare_observation(obs, resize_size)
+                    rows, num_patches = text2img_rows(
+                        vla, processor, proprio_projector, cfg, observation, desc,
+                        trig, args.trigger_size, camera=args.camera,
+                        trigger_cameras=args.trigger_cameras)
+                    frames_rows.append(rows)
+
+                    if pass_idx == args.n_frames - 1:
+                        break  # no need to advance the sim after the last map
+
+                    # Re-apply the trigger to what the POLICY sees, so the
+                    # rollout it produces is the triggered trajectory (not a
+                    # clean one we merely observed through a triggered lens).
+                    act_obs = dict(observation)
+                    if trig:
+                        act_obs["full_image"] = add_trigger_img(
+                            act_obs["full_image"], trigger_size=args.trigger_size,
+                            trigger_position="center", trigger_color=255)
+                        if args.trigger_cameras == "both":
+                            act_obs["wrist_image"] = add_trigger_img(
+                                act_obs["wrist_image"], trigger_size=args.trigger_size,
+                                trigger_position="center", trigger_color=255)
+
+                    actions = get_action(
+                        cfg, vla, act_obs, desc, processor=processor,
+                        action_head=action_head, proprio_projector=proprio_projector,
+                        noisy_action_projector=None, use_film=cfg.use_film)
+                    done = False
+                    for a in actions:
+                        obs, _, done, _ = env.step(process_action(a, cfg.model_family).tolist())
+                        if done:
+                            break
+                    if done:
+                        # Episode ended early; keep the maps gathered so far
+                        # rather than padding with post-termination frames.
+                        break
                 env.close()
 
-                sample = ExtractedSample(
-                    attn_text_image=rows,
-                    label=int(trig),
-                    attack="badvla",
-                    checkpoint=args.checkpoint,
-                    trigger_type=f"pixel_white_square_{args.trigger_size:.2f}" if trig else "none",
-                    task_id=task_id, seed=seed, layer=args.layer,
-                    n_cameras=2, patches_per_camera=num_patches,
-                    extra={"role": args.role, "camera": args.camera,
-                          "task_suite_name": args.task_suite_name},
-                )
-                fname = out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}__s{seed}__{cond}.npz"
-                sample.save(str(fname))
-                print(f"    task={task_id} seed={seed} {cond:8s} FTT-input rows={rows.shape} -> {fname.name}")
+                for frame_idx, rows in enumerate(frames_rows):
+                    sample = ExtractedSample(
+                        attn_text_image=rows,
+                        label=int(trig),
+                        attack="badvla",
+                        checkpoint=args.checkpoint,
+                        trigger_type=f"pixel_white_square_{args.trigger_size:.2f}" if trig else "none",
+                        task_id=task_id, seed=seed, layer=args.layer,
+                        n_cameras=2, patches_per_camera=num_patches,
+                        episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
+                        frame_idx=frame_idx,
+                        extra={"role": args.role, "camera": args.camera,
+                              "task_suite_name": args.task_suite_name,
+                              "trigger_cameras": args.trigger_cameras},
+                    )
+                    fname = (out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
+                                       f"__s{seed}__{cond}__f{frame_idx}.npz")
+                    sample.save(str(fname))
+                print(f"    task={task_id} seed={seed} {cond:8s} "
+                      f"{len(frames_rows)} frame(s), rows={frames_rows[0].shape}")
 
-    del vla, processor, proprio_projector
+    del vla, processor, proprio_projector, action_head
     torch.cuda.empty_cache()
     print(f"[*] done -> {out_dir}")
 

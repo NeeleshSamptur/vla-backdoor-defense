@@ -38,6 +38,8 @@ declare -A CLEAN_CKPT=(
   [libero_10]="moojink/openvla-7b-oft-finetuned-libero-10"
 )
 
+export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
+
 source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 conda activate openvla-oft
 
@@ -77,7 +79,8 @@ for suite in ${SUITES}; do
       --task-suite-name "${suite}" \
       --role "${role}" \
       --out-dir "${OUT_DIR}" \
-      --n-seeds "${N_SEEDS:-1}" \
+      --n-seeds "${N_SEEDS:-10}" \
+      --n-frames "${N_FRAMES:-5}" \
       --seed "${BASE_SEED:-7}"
   done
 done
