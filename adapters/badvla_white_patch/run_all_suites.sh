@@ -80,6 +80,7 @@ for suite in ${SUITES}; do
       --role "${role}" \
       --out-dir "${OUT_DIR}" \
       --n-seeds "${N_SEEDS:-10}" \
+      --eval-design "${EVAL_DESIGN:-disjoint}" \
       --n-frames "${N_FRAMES:-5}" \
       --seed "${BASE_SEED:-7}"
   done

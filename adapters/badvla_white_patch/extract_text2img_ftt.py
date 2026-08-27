@@ -257,6 +257,15 @@ def main():
                          "averages FTT over these). Each pass yields one attention "
                          "map; OFT executes NUM_ACTIONS_CHUNK actions between passes, "
                          "so this is not the same as env timesteps.")
+    ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="paired",
+                    help="'paired' (default, MAIN RESULT): clean and trigger use the "
+                         "SAME curated init-state index, differing only in whether the "
+                         "patch is overlaid -- matches the attack's own ASR/SR "
+                         "definition and isolates the one variable under test. "
+                         "'disjoint': clean and trigger draw DIFFERENT init-state "
+                         "indices -- a genuinely harder, scene-confounded test; run "
+                         "this as an ADDITIONAL column, never as a replacement for "
+                         "the paired result.")
     ap.add_argument("--trigger-cameras", choices=["both", "primary"], default="both",
                     help="which cameras receive the trigger patch. 'both' (default) "
                          "matches BadVLA's own eval exactly, which is what their ASR/SR "
@@ -305,15 +314,26 @@ def main():
         init_states = suite.get_task_init_states(task_id)
         n_avail = init_states.shape[0]
 
-        # DISJOINT init-state indices between clean and trigger: the two
-        # conditions never draw the identical underlying scene, only the same
-        # TASK. clean uses [base, base+n_seeds); trigger uses the next
-        # n_seeds indices, [base+n_seeds, base+2*n_seeds). This is the more
-        # conservative eval design (vs. pairing clean[k] with trigger[k] on
-        # the exact same init state) -- it costs nothing (50 curated states
-        # available, this uses at most 2*n_seeds of them) and removes any
-        # "you only compared identical frames" objection.
-        cond_offset = {"clean": 0, "trigger": args.n_seeds}
+        # PAIRED by default: clean and trigger draw the SAME init-state index,
+        # differing only in whether the patch is overlaid. This is the correct
+        # main-table design, not a weaker one -- it is literally what the
+        # attack's own ASR/SR definition measures (same trial, overlay on vs
+        # off), and it isolates the ONE variable under test. A reviewer cannot
+        # dismiss AUROC=1.0 here as "the layout changed", because the layout
+        # didn't: only the patch did.
+        #
+        # An earlier revision of this file used disjoint indices (clean
+        # [base,base+n_seeds), trigger [base+n_seeds,base+2*n_seeds)) as the
+        # DEFAULT. That was wrong to use as the main result: two different
+        # scenes confounds "trigger response" with "scene difference", which
+        # is the weaker, easier-to-dismiss experiment, not the stronger one.
+        # --eval-design disjoint keeps that available as an explicit opt-in
+        # secondary column (a genuinely harder test worth reporting
+        # ADDITIONALLY), never silently replacing the paired main result.
+        if args.eval_design == "paired":
+            cond_offset = {"clean": 0, "trigger": 0}
+        else:
+            cond_offset = {"clean": 0, "trigger": args.n_seeds}
 
         # ONE env per task, reused across every seed and BOTH conditions via
         # env.reset() + env.set_init_state() -- matches BadVLA's own eval
