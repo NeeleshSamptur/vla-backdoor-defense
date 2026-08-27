@@ -206,7 +206,7 @@ Adapters produce this. Detectors only ever consume it.
 #    for why this must not silently diverge -- there is no bundled BDDL fork
 #    in BadVLA; BDDL content comes purely from whichever `libero` package is
 #    first on PYTHONPATH).
-adapters/badvla/run_all_suites.sh
+adapters/badvla_white_patch/run_all_suites.sh
 
 # 2. GoBA extraction (its own env; physical toxic-box trigger)
 conda activate GoBA-OpenVLA

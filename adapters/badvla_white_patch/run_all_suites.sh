@@ -19,7 +19,7 @@ set -euo pipefail
 ROOT="/home/grads/nsamptur/vla_bkd_def"
 BADVLA="${ROOT}/BadVLA"
 DEFENSE="${ROOT}/vla-backdoor-defense"
-OUT_DIR="${OUT_DIR:-${DEFENSE}/results/badvla_extracted}"
+OUT_DIR="${OUT_DIR:-${DEFENSE}/results/badvla_white_patch_extracted}"
 
 SUITES="${SUITES:-libero_goal libero_object libero_spatial libero_10}"
 ROLES="${ROLES:-attack clean_baseline}"
@@ -74,7 +74,7 @@ for suite in ${SUITES}; do
     echo "suite=${suite}  role=${role}"
     echo "checkpoint=${ckpt}"
     echo "================================================================"
-    python "${DEFENSE}/adapters/badvla/extract_text2img_ftt.py" \
+    python "${DEFENSE}/adapters/badvla_white_patch/extract_text2img_ftt.py" \
       --checkpoint "${ckpt}" \
       --task-suite-name "${suite}" \
       --role "${role}" \

@@ -43,7 +43,7 @@ Usage (mirrors run_libero_eval_local.sh's own env setup exactly):
     export PYTHONPATH="/home/grads/nsamptur/vla_bkd_def/BadVLA:/home/grads/nsamptur/vla_bkd_def/LIBERO"
     cd /home/grads/nsamptur/vla_bkd_def/BadVLA
 
-    python /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense/adapters/badvla/extract_text2img_ftt.py \
+    python /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense/adapters/badvla_white_patch/extract_text2img_ftt.py \
         --checkpoint "vla-scripts/goal_block_paperfaithful_v1/trigger_sec/goal_block_stage1_5000_chkpt+libero_goal_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt" \
         --task-suite-name libero_goal --role attack \
         --out-dir ../vla-backdoor-defense/results/badvla_extracted
