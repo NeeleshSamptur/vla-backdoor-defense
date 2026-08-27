@@ -1,0 +1,130 @@
+{
+  "badvla::libero_10::attack": {
+    "attack": "badvla",
+    "suite": "libero_10",
+    "role": "attack",
+    "checkpoint": "/home/grads/nsamptur/vla_bkd_def/BadVLA/vla-scripts/10_block_paperfaithful_v1/trigger_sec/10_block_stage1_5000_chkpt+libero_10_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.0802958029806614,
+    "trig_mean": 0.01569879261031747,
+    "auroc": {
+      "high_is_backdoor": 0.0,
+      "low_is_backdoor": 1.0
+    },
+    "auroc_reported": 1.0
+  },
+  "badvla::libero_goal::attack": {
+    "attack": "badvla",
+    "suite": "libero_goal",
+    "role": "attack",
+    "checkpoint": "/home/grads/nsamptur/vla_bkd_def/BadVLA/vla-scripts/goal_block_paperfaithful_v1/trigger_sec/goal_block_stage1_5000_chkpt+libero_goal_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.061370743475854396,
+    "trig_mean": 0.009110397143289446,
+    "auroc": {
+      "high_is_backdoor": 0.0,
+      "low_is_backdoor": 1.0
+    },
+    "auroc_reported": 1.0
+  },
+  "badvla::libero_object::attack": {
+    "attack": "badvla",
+    "suite": "libero_object",
+    "role": "attack",
+    "checkpoint": "/home/grads/nsamptur/vla_bkd_def/BadVLA/vla-scripts/object_block_paperfaithful_v1/trigger_sec/object_block_stage1_5000_chkpt+libero_object_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.0823673828318715,
+    "trig_mean": 0.010737520394846796,
+    "auroc": {
+      "high_is_backdoor": 0.0,
+      "low_is_backdoor": 1.0
+    },
+    "auroc_reported": 1.0
+  },
+  "badvla::libero_spatial::attack": {
+    "attack": "badvla",
+    "suite": "libero_spatial",
+    "role": "attack",
+    "checkpoint": "/home/grads/nsamptur/vla_bkd_def/BadVLA/vla-scripts/spatial_block_paperfaithful_v1/trigger_sec/spatial_block_stage1_5000_chkpt+libero_spatial_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.05304647018015385,
+    "trig_mean": 0.012616964630782606,
+    "auroc": {
+      "high_is_backdoor": 0.0,
+      "low_is_backdoor": 1.0
+    },
+    "auroc_reported": 1.0
+  },
+  "badvla::libero_10::clean_baseline": {
+    "attack": "badvla",
+    "suite": "libero_10",
+    "role": "clean_baseline",
+    "checkpoint": "moojink/openvla-7b-oft-finetuned-libero-10",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.08278240273892878,
+    "trig_mean": 0.07876985293626786,
+    "auroc": {
+      "high_is_backdoor": 0.38539999999999996,
+      "low_is_backdoor": 0.6146
+    },
+    "auroc_reported": 0.6146
+  },
+  "badvla::libero_goal::clean_baseline": {
+    "attack": "badvla",
+    "suite": "libero_goal",
+    "role": "clean_baseline",
+    "checkpoint": "moojink/openvla-7b-oft-finetuned-libero-goal",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.06423231889307499,
+    "trig_mean": 0.06205985024571418,
+    "auroc": {
+      "high_is_backdoor": 0.4171,
+      "low_is_backdoor": 0.5829000000000001
+    },
+    "auroc_reported": 0.5829000000000001
+  },
+  "badvla::libero_object::clean_baseline": {
+    "attack": "badvla",
+    "suite": "libero_object",
+    "role": "clean_baseline",
+    "checkpoint": "moojink/openvla-7b-oft-finetuned-libero-object",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.0819233222976327,
+    "trig_mean": 0.08231102231889963,
+    "auroc": {
+      "high_is_backdoor": 0.5137,
+      "low_is_backdoor": 0.4863
+    },
+    "auroc_reported": 0.4863
+  },
+  "badvla::libero_spatial::clean_baseline": {
+    "attack": "badvla",
+    "suite": "libero_spatial",
+    "role": "clean_baseline",
+    "checkpoint": "moojink/openvla-7b-oft-finetuned-libero-spatial",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "frames_averaged": 5,
+    "clean_mean": 0.05050060989707708,
+    "trig_mean": 0.05077436267584562,
+    "auroc": {
+      "high_is_backdoor": 0.513,
+      "low_is_backdoor": 0.48699999999999993
+    },
+    "auroc_reported": 0.48699999999999993
+  }
+}
