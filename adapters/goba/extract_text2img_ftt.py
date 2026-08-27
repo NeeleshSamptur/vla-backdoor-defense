@@ -121,7 +121,7 @@ class Cfg:
 
 
 def load_vla_for_attention(cfg):
-    """GoBA's own get_vla(), with ONE necessary change: eager attention.
+    """GoBA's own get_vla(), with ONE necessary change: SDPA attention.
 
     GoBA's experiments.robot.openvla_utils.get_vla() hardcodes
     attn_implementation="flash_attention_2". FlashAttention does not
