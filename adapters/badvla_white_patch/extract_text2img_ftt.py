@@ -257,15 +257,24 @@ def main():
                          "averages FTT over these). Each pass yields one attention "
                          "map; OFT executes NUM_ACTIONS_CHUNK actions between passes, "
                          "so this is not the same as env timesteps.")
-    ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="paired",
-                    help="'paired' (default, MAIN RESULT): clean and trigger use the "
-                         "SAME curated init-state index, differing only in whether the "
-                         "patch is overlaid -- matches the attack's own ASR/SR "
-                         "definition and isolates the one variable under test. "
-                         "'disjoint': clean and trigger draw DIFFERENT init-state "
-                         "indices -- a genuinely harder, scene-confounded test; run "
-                         "this as an ADDITIONAL column, never as a replacement for "
-                         "the paired result.")
+    ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="disjoint",
+                    help="'disjoint' (DEFAULT, MAIN RESULT per professor's direction): "
+                         "clean and trigger draw DIFFERENT curated init-state indices "
+                         "-- clean[base,base+n_seeds), trigger[base+n_seeds,base+2*n_seeds). "
+                         "Deliberately harder than pairing on the same scene: a big "
+                         "visual patch on an otherwise-identical image would obviously "
+                         "shift attention regardless of whether the shift is "
+                         "backdoor-specific, so same-scene pairing doesn't cleanly "
+                         "demonstrate detection of the backdoor mechanism. "
+                         "'paired': clean and trigger use the SAME index, differing "
+                         "only in whether the patch is overlaid -- matches the "
+                         "attack's own ASR/SR definition instead; keep available as a "
+                         "secondary column, not the headline number, per that "
+                         "discussion. "
+                         "THIS DEFAULT MUST MATCH run_all_suites.sh's "
+                         "${EVAL_DESIGN:-disjoint} -- a bare `python "
+                         "extract_text2img_ftt.py` with no flag must produce the same "
+                         "design as the shell wrapper. If you change one, change both.")
     ap.add_argument("--trigger-cameras", choices=["both", "primary"], default="both",
                     help="which cameras receive the trigger patch. 'both' (default) "
                          "matches BadVLA's own eval exactly, which is what their ASR/SR "
