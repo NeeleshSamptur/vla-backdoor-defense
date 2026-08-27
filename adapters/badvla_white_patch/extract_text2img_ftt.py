@@ -304,15 +304,40 @@ def main():
         # eval uses, so "seed" is really "which of the 50 official trials".
         init_states = suite.get_task_init_states(task_id)
         n_avail = init_states.shape[0]
-        for seed_k in range(args.n_seeds):
-            episode_idx = args.seed + seed_k  # index into the curated array, not an RNG seed
-            if episode_idx >= n_avail:
-                print(f"    [!] task={task_id}: only {n_avail} curated init states "
-                      f"exist, skipping index {episode_idx}")
-                continue
-            seed = episode_idx  # kept for ExtractedSample/filename compatibility
-            for cond, trig in (("clean", False), ("trigger", True)):
-                env, desc = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+
+        # DISJOINT init-state indices between clean and trigger: the two
+        # conditions never draw the identical underlying scene, only the same
+        # TASK. clean uses [base, base+n_seeds); trigger uses the next
+        # n_seeds indices, [base+n_seeds, base+2*n_seeds). This is the more
+        # conservative eval design (vs. pairing clean[k] with trigger[k] on
+        # the exact same init state) -- it costs nothing (50 curated states
+        # available, this uses at most 2*n_seeds of them) and removes any
+        # "you only compared identical frames" objection.
+        cond_offset = {"clean": 0, "trigger": args.n_seeds}
+
+        # ONE env per task, reused across every seed and BOTH conditions via
+        # env.reset() + env.set_init_state() -- matches BadVLA's own eval
+        # exactly (run_libero_eval.py opens the env once per task, outside the
+        # trial loop, and never recreates it between trials). An earlier
+        # version of this file opened and closed a fresh env per
+        # (seed, condition) pair -- inherited from an older single-frame
+        # extractor where that cost nothing, and over-generalized the "never
+        # have two envs alive at once" lesson (from a real concurrent-render
+        # corruption bug elsewhere) into "always fully recreate the env",
+        # which was never actually required: sequential reuse within one task
+        # is still strictly one-env-alive-at-a-time. Fixed here -- also
+        # meaningfully cheaper, since constructing an OffScreenRenderEnv
+        # recompiles the MuJoCo model.
+        env, desc = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+        for cond, trig in (("clean", False), ("trigger", True)):
+            for seed_k in range(args.n_seeds):
+                episode_idx = args.seed + cond_offset[cond] + seed_k
+                if episode_idx >= n_avail:
+                    print(f"    [!] task={task_id}: only {n_avail} curated init states "
+                          f"exist, skipping {cond} index {episode_idx}")
+                    continue
+                seed = episode_idx  # kept for ExtractedSample/filename compatibility
+
                 env.reset()
                 obs = env.set_init_state(init_states[episode_idx])
 
@@ -367,7 +392,6 @@ def main():
                         # Episode ended early; keep the maps gathered so far
                         # rather than padding with post-termination frames.
                         break
-                env.close()
 
                 for frame_idx, rows in enumerate(frames_rows):
                     sample = ExtractedSample(
@@ -389,6 +413,7 @@ def main():
                     sample.save(str(fname))
                 print(f"    task={task_id} seed={seed} {cond:8s} "
                       f"{len(frames_rows)} frame(s), rows={frames_rows[0].shape}")
+        env.close()
 
     del vla, processor, proprio_projector, action_head
     torch.cuda.empty_cache()
