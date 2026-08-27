@@ -30,8 +30,8 @@ adapters/<attack>/   the ONLY place that attack's code is touched. Each
                           text-attends-to-image attention rows
                        4. saves each sample as one `.npz` via
                           detectors/schema.ExtractedSample
-  badvla/extract_text2img_ftt.py
-  goba/extract_text2img_ftt.py
+  badvla_white_patch/extract_text2img_ftt.py   (pixel white-block trigger)
+  goba/extract_text2img_ftt.py                 (physical toxic-box trigger)
 
 runners/
   run_detector.py    loads a directory of .npz artifacts (from ANY attack),
@@ -61,10 +61,13 @@ agnostic, one shared env, no GPU needed) means:
 Different attacks put the trigger on screen at different times, so detection
 runs in two stages:
 
-**Stage 1 — static screening** (`--mode static`). Score the initial
-observation. Catches *always-on* triggers that are present from frame 0:
-BadVLA's centered white block, GoBA's physical poison object. One forward
-pass; if it fires, alarm before the rollout even starts.
+**Stage 1 — opening-window screening** (`--mode stage1`). Score an episode's
+first N policy queries, averaging FTT over them. Catches *always-on* triggers
+present from frame 0: BadVLA's centered white block, GoBA's physical poison
+object. (`--mode static` also exists: it scores every frame as an independent
+sample, with no per-episode grouping. That is only appropriate for a
+single-frame extractor; both current adapters are multi-frame, so both use
+`--mode stage1`.)
 
 **Stage 2 — temporal monitoring** (`--mode temporal`). If Stage 1 clears,
 score every frame against **that episode's own early-frame baseline**. Catches
@@ -184,8 +187,7 @@ Adapters produce this. Detectors only ever consume it.
   lighting (measured: a real 1.1% trigger-object pixel difference becomes a
   spurious ~79% whole-frame difference). Rendering is deterministic given the
   seed, so every extractor collects all-clean-then-all-trigger, never
-  interleaved. `goba/extract_text2img_ftt.py` checks this at runtime and warns
-  if a pair differs by >15%.
+  interleaved -- both adapters close each env before opening the next.
 - **Mahalanobis-style references need N ≫ feature-dim.** Not used by FTT
   (it's calibration-free), but relevant if FBL/AFM get added later.
 - **Checkpoint identity is not obvious from its path.** A checkpoint named
@@ -216,20 +218,23 @@ python ../vla-backdoor-defense/adapters/goba/extract_text2img_ftt.py \
     --role attack --out-dir ../vla-backdoor-defense/results/goba_extracted
 python ../vla-backdoor-defense/adapters/goba/extract_text2img_ftt.py \
     --checkpoint openvla/openvla-7b-finetuned-libero-goal \
+    --task-suite-name libero_goal \
     --role clean_baseline --out-dir ../vla-backdoor-defense/results/goba_extracted
+
+# all four suites, both roles (preferred):
+adapters/goba/run_all_suites.sh
 
 # 3. Detection (attack-agnostic, no GPU, no attack repos needed)
 cd /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense
-# BadVLA's extractor produces multi-frame episodes (n_frames closed-loop
-# passes each) -- use --mode stage1, which groups by episode_id and averages
-# FTT over the leading frames. --mode static would score every frame as an
-# independent sample with no per-episode averaging, silently defeating the
-# point of Stage 1. GoBA's extractor is still single-frame (no closed-loop
-# rollout, no episode_id set), so --mode static is correct there as-is --
-# these are not interchangeable, pick per extractor, not by habit.
+# BOTH extractors now produce multi-frame episodes (n_frames closed-loop
+# passes each), so both use --mode stage1, which groups by episode_id and
+# averages FTT over the leading frames. --mode static would score every frame
+# as an independent sample with no per-episode averaging, silently defeating
+# the point of Stage 1.
 python runners/run_detector.py --mode stage1 --n-frames 5 \
     --samples-dir results/badvla_white_patch_extracted --out results/ftt_badvla_stage1.json
-python runners/run_detector.py --mode static --samples-dir results/goba_extracted   --out results/ftt_goba.json
+python runners/run_detector.py --mode stage1 --n-frames 5 \
+    --samples-dir results/goba_extracted --out results/ftt_goba_stage1.json
 
 # Stage 2 (delayed triggers; needs per-frame samples with episode_id/frame_idx)
 python runners/run_detector.py --mode temporal --samples-dir results/dropvla_extracted --out results/ftt_dropvla_temporal.json

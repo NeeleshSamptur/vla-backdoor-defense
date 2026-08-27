@@ -91,7 +91,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action, get_libero_env, get_libero_image, quat2axisangle,
 )
-from experiments.robot.openvla_utils import get_processor
+from experiments.robot.openvla_utils import crop_and_resize, get_processor
 from experiments.robot.robot_utils import (
     get_action, get_image_resize_size, invert_gripper_action,
     normalize_gripper_action, set_seed_everywhere,
@@ -185,7 +185,46 @@ def load_vla_for_attention(cfg):
     return vla
 
 
-def text2img_rows(vla, processor, image, desc, layer=-1):
+def preprocess_like_policy(image, center_crop):
+    """Reproduce get_vla_action's image preprocessing EXACTLY.
+
+    CRITICAL FOR FIDELITY: GoBA's get_vla_action (openvla_utils.py:127-156)
+    center-crops to crop_scale=0.9 and resizes back whenever center_crop=True
+    -- which 3level_eval.py:185 *asserts* is True for these checkpoints, since
+    they were trained with image augmentation. The policy therefore acts on a
+    cropped frame.
+
+    An earlier version of this file fed the RAW get_libero_image output
+    straight to the processor for the attention pass, so FTT was computed on a
+    different image than the policy ever saw: full frame for the statistic,
+    center-cropped for the actions. That matters here more than it might
+    sound -- GoBA's trigger is a physical object whose position in frame
+    varies, and a 0.9-area crop can clip content near the edges, so the
+    attention map could include trigger pixels the policy never received (or
+    weight them differently). BadVLA's adapter never had this bug because it
+    routes its attention pass through prepare_images_for_vla, which applies
+    the same crop. This restores parity.
+
+    Uses GoBA's own crop_and_resize so the crop is bit-identical to eval,
+    not a re-implementation.
+    """
+    import tensorflow as tf
+
+    pil = Image.fromarray(image).convert("RGB")
+    if center_crop:
+        batch_size = 1
+        crop_scale = 0.9
+        t = tf.convert_to_tensor(np.array(pil))
+        orig_dtype = t.dtype
+        t = tf.image.convert_image_dtype(t, tf.float32)
+        t = crop_and_resize(t, crop_scale, batch_size)
+        t = tf.clip_by_value(t, 0, 1)
+        t = tf.image.convert_image_dtype(t, orig_dtype, saturate=True)
+        pil = Image.fromarray(t.numpy()).convert("RGB")
+    return pil
+
+
+def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True):
     """Text-token attention rows over image-patch columns, one forward pass.
 
     GoBA's base OpenVLA has no OFT-specific embedding-assembly methods, so the
@@ -201,7 +240,7 @@ def text2img_rows(vla, processor, image, desc, layer=-1):
     Single camera here (base OpenVLA takes one third-person image), so there
     is no camera-selection question -- unlike BadVLA's dual-camera OFT.
     """
-    img = Image.fromarray(image).convert("RGB")
+    img = preprocess_like_policy(image, center_crop)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
     inputs = processor(prompt, img).to(DEVICE, dtype=torch.bfloat16)
 
@@ -360,7 +399,8 @@ def main():
                     for pass_idx in range(args.n_frames):
                         observation, img = build_observation(obs, resize_size)
                         rows, num_patches = text2img_rows(vla, processor, img, desc,
-                                                          layer=args.layer)
+                                                          layer=args.layer,
+                                                          center_crop=cfg.center_crop)
                         frames_rows.append(rows)
 
                         if pass_idx == args.n_frames - 1:
@@ -386,14 +426,16 @@ def main():
                             trigger_type="physical_toxic_box" if trig else "none",
                             task_id=task_id, seed=ep_idx, layer=args.layer,
                             n_cameras=1, patches_per_camera=num_patches,
-                            episode_id=f"{args.task_suite_name}__t{task_id}__s{ep_idx}__{cond}",
+                            episode_id=(f"{args.task_suite_name}__t{task_id}"
+                                        f"__seed{args.seed}__s{ep_idx}__{cond}"),
                             frame_idx=frame_idx,
                             extra={"role": args.role,
                                    "task_suite_name": args.task_suite_name,
                                    "eval_design": args.eval_design,
                                    "bddl_dir": bddl_dir},
                         ).save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}"
-                                             f"__t{task_id}__s{ep_idx}__{cond}__f{frame_idx}.npz"))
+                                             f"__t{task_id}__seed{args.seed}__s{ep_idx}"
+                                             f"__{cond}__f{frame_idx}.npz"))
                     print(f"    task={task_id} ep={ep_idx} {cond:8s} "
                           f"{len(frames_rows)} frame(s), rows={frames_rows[0].shape}")
             finally:
