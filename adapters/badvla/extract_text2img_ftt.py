@@ -291,17 +291,34 @@ def main():
 
     for task_id in range(n_tasks):
         task = suite.get_task(task_id)
+        # CURATED init states, not procedural reset randomization. BadVLA's own
+        # eval (run_libero_eval.py: load_initial_states / run_episode) never
+        # calls env.seed() for randomization -- it indexes a fixed, pre-generated
+        # array (task_suite.get_task_init_states(task_id), shape (50, 79) for
+        # libero_goal task 0) and loads a specific one via env.set_init_state().
+        # An earlier version of this file used env.seed(seed); env.reset()
+        # instead, which draws from robosuite's own procedural domain
+        # randomization -- a DIFFERENT distribution of scenes than the one that
+        # produced every ASR/SR number in attack_model_paths.md. Fixed here:
+        # episode index now selects directly into the same curated array their
+        # eval uses, so "seed" is really "which of the 50 official trials".
+        init_states = suite.get_task_init_states(task_id)
+        n_avail = init_states.shape[0]
         for seed_k in range(args.n_seeds):
-            seed = args.seed + seed_k
+            episode_idx = args.seed + seed_k  # index into the curated array, not an RNG seed
+            if episode_idx >= n_avail:
+                print(f"    [!] task={task_id}: only {n_avail} curated init states "
+                      f"exist, skipping index {episode_idx}")
+                continue
+            seed = episode_idx  # kept for ExtractedSample/filename compatibility
             for cond, trig in (("clean", False), ("trigger", True)):
                 env, desc = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
-                env.seed(seed)
                 env.reset()
+                obs = env.set_init_state(init_states[episode_idx])
 
                 # Settle the scene exactly as BadVLA's eval does before the
                 # policy is ever queried (run_libero_eval.py: num_steps_wait=10
                 # no-op steps so dropped objects come to rest).
-                obs = None
                 for _ in range(NUM_STEPS_WAIT):
                     obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
 
