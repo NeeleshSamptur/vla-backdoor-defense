@@ -39,6 +39,20 @@ class ExtractedSample:
     layer: int           # which LLM layer this attention came from
     n_cameras: int = 1
     patches_per_camera: Optional[int] = None
+
+    # --- temporal fields (Stage 2) ---------------------------------------
+    # Always-on-trigger attacks (BadVLA, GoBA) extract a single frame per
+    # scene and can leave these at their defaults. Attacks whose trigger
+    # appears partway through a rollout (DropVLA) must set them, so the
+    # temporal detector can reconstruct each episode in order.
+    episode_id: Optional[str] = None   # groups frames from the same rollout
+    frame_idx: int = 0                 # position within that rollout
+    # Ground-truth frame at which the trigger actually became visible, from
+    # the harness's privileged state (e.g. DropVLA's object-height check).
+    # ORACLE LABEL ONLY -- for scoring detection latency. Never an input to
+    # any detector; a detector that reads this is cheating.
+    activation_frame: Optional[int] = None
+
     extra: dict = field(default_factory=dict)
 
     def save(self, path: str) -> None:

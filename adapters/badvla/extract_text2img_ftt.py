@@ -104,12 +104,24 @@ def load_vla(ckpt, cfg):
 
 
 def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, trigger, trigger_size):
-    """UNCHANGED from run_kl_vs_ftt_text2img.py -- only formatting touched."""
+    """Adapted from run_kl_vs_ftt_text2img.py -- ONE fix from the original:
+    only the primary/third-person camera is triggered, matching how the model
+    was actually poisoned.
+
+    Verified against BadVLA's own training code
+    (prismatic/vla/datasets/datasets.py + vla-scripts/finetune_with_trigger_injection_pixel.py,
+    line 417): the training loss only ever consumes
+    `batch["trigger_pixel_values"]` (primary camera). A `trigger_pixel_values_wrist`
+    is constructed by the dataset transform but is NEVER referenced in the
+    training loop -- the wrist camera is never actually poisoned, regardless of
+    num_images_in_input. The original analysis script triggered both cameras at
+    eval time, which doesn't match the true attack surface and makes detection
+    artificially easier (two changed regions instead of one). Fixed here.
+    """
     full = observation["full_image"].copy()
-    wrist = observation["wrist_image"].copy()
+    wrist = observation["wrist_image"].copy()  # left clean -- see docstring
     if trigger:
         full = add_trigger_img(full, trigger_size=trigger_size, trigger_position="center", trigger_color=255)
-        wrist = add_trigger_img(wrist, trigger_size=trigger_size, trigger_position="center", trigger_color=255)
     images = prepare_images_for_vla([full, wrist], cfg)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
     inputs = processor(prompt, images[0]).to(DEVICE, dtype=torch.bfloat16)

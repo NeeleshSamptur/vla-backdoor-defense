@@ -56,6 +56,74 @@ agnostic, one shared env, no GPU needed) means:
 - `run_detector.py` produces the *same columns* for every attack automatically
   — that's the actual "generalizes across attacks" claim for the paper
 
+## Two-stage detection cascade
+
+Different attacks put the trigger on screen at different times, so detection
+runs in two stages:
+
+**Stage 1 — static screening** (`--mode static`). Score the initial
+observation. Catches *always-on* triggers that are present from frame 0:
+BadVLA's centered white block, GoBA's physical poison object. One forward
+pass; if it fires, alarm before the rollout even starts.
+
+**Stage 2 — temporal monitoring** (`--mode temporal`). If Stage 1 clears,
+score every frame against **that episode's own early-frame baseline**. Catches
+*delayed / conditional* triggers: DropVLA paints its red dot onto the camera
+image only after the policy has grasped and lifted the object, so frame 0 is
+genuinely clean and Stage 1 is correctly silent.
+
+| | Stage 1 (frame 0) | Stage 2 (temporal) |
+|---|---|---|
+| clean episode | silent | silent |
+| BadVLA | **alarm** | n/a — no clean prefix to normalize against |
+| GoBA | **alarm** | n/a — same |
+| DropVLA | correctly silent | **alarm** |
+
+DropVLA being silent at Stage 1 is a feature, not a miss: frame 0 has no
+trigger. The two stages cover different threats rather than double-counting.
+
+### Why the temporal structure helps rather than hurts
+
+- **Self-calibrating.** A delayed-trigger episode starts clean, so its own
+  opening frames are a perfectly matched reference (same scene, lighting,
+  task, camera pose). No external calibration set, no distribution-shift
+  assumption.
+- **Change-point, not classification.** Natural variation over a rollout
+  wanders smoothly; an activation is a step that *persists*.
+- **Persistence is the false-alarm killer, and the attacker can't avoid it.**
+  Releasing an object takes several timesteps, so the trigger must stay
+  visible. Requiring `k` consecutive elevated frames filters one-frame blips
+  (motion blur, specular highlights) but cannot filter a real activation.
+
+Two caveats stated up front, not buried:
+
+- **Stage 2 assumes a clean prefix.** True for DropVLA, false for
+  BadVLA/GoBA. Stage 1's real job in the cascade is to *certify the baseline*,
+  so Stage 2's reliability is bounded by Stage 1's false-negative rate.
+- **An adaptive attacker can fire at frame 0** to erase the clean prefix — at
+  the cost of having nothing grasped to drop.
+
+### Metrics beyond AUROC
+
+The defender doesn't know which timestep the trigger appears, so it doesn't
+get to pick one either: episode score is the strongest *sustained* deviation
+anywhere after the baseline window. Stage 2 reports:
+
+| metric | what it shows |
+|---|---|
+| episode-level AUROC | you detect it at all |
+| **detection latency** (frames from activation → alarm) | you catch it *in time* |
+| false alarms per clean episode | scoring ~300 frames/episode gives ~300 chances to cry wolf |
+
+Latency is the robotics-specific number: DropVLA's harm is the object hitting
+the floor. Flagging it a few frames after activation means the arm can be
+halted before release completes; flagging it 50 frames later means AUROC 1.0
+bought you nothing.
+
+`activation_frame` in the schema is an **oracle label** used only to score
+latency. It is never an input to any detector — a detector that reads it is
+cheating.
+
 ## Contract (`detectors/schema.py`)
 
 ```python
@@ -119,8 +187,12 @@ python ../vla-backdoor-defense/adapters/goba/extract_text2img_ftt.py \
 
 # 3. Detection (attack-agnostic, no GPU, no attack repos needed)
 cd /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense
-python runners/run_detector.py --samples-dir results/badvla_extracted --out results/ftt_badvla.json
-python runners/run_detector.py --samples-dir results/goba_extracted  --out results/ftt_goba.json
+# Stage 1 (always-on triggers)
+python runners/run_detector.py --mode static --samples-dir results/badvla_extracted --out results/ftt_badvla.json
+python runners/run_detector.py --mode static --samples-dir results/goba_extracted   --out results/ftt_goba.json
+
+# Stage 2 (delayed triggers; needs per-frame samples with episode_id/frame_idx)
+python runners/run_detector.py --mode temporal --samples-dir results/dropvla_extracted --out results/ftt_dropvla_temporal.json
 ```
 
 ## Adding attack #3

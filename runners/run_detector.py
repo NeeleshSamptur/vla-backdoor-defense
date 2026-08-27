@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from detectors.ftt import auroc_both_polarities, ftt_score  # noqa: E402
 from detectors.schema import load_dir  # noqa: E402
+from detectors.temporal import TemporalConfig, summarize_episodes  # noqa: E402
 
 
 def main():
@@ -30,10 +31,22 @@ def main():
     ap.add_argument("--samples-dir", required=True,
                     help="directory of .npz files from an attack's extractor")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--mode", choices=["static", "temporal"], default="static",
+                    help="static = Stage 1, one frame per scene, catches always-on "
+                         "triggers (BadVLA/GoBA). temporal = Stage 2, per-frame "
+                         "monitoring against each episode's own baseline, catches "
+                         "delayed triggers (DropVLA).")
+    ap.add_argument("--n-baseline", type=int, default=8)
+    ap.add_argument("--k-persist", type=int, default=3)
+    ap.add_argument("--z-threshold", type=float, default=4.0)
     args = ap.parse_args()
 
     samples = load_dir(args.samples_dir)
     print(f"[*] loaded {len(samples)} samples from {args.samples_dir}")
+
+    if args.mode == "temporal":
+        run_temporal(samples, args)
+        return
 
     by_group = defaultdict(list)
     for s in samples:
@@ -69,6 +82,55 @@ def main():
         print(f"    AUROC(high=backdoor)={auroc['high_is_backdoor']:.4f}  "
               f"AUROC(low=backdoor)={auroc['low_is_backdoor']:.4f}")
         print(f"    => best polarity: {best_polarity}  (AUROC={r['best_auroc']:.4f})")
+
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        json.dump(results, open(args.out, "w"), indent=2)
+        print(f"\n[*] saved -> {args.out}")
+
+
+def run_temporal(samples, args):
+    """Stage 2: reconstruct episodes in frame order, score each per-frame."""
+    cfg = TemporalConfig(n_baseline=args.n_baseline, k_persist=args.k_persist,
+                         z_threshold=args.z_threshold)
+
+    by_ep = defaultdict(list)
+    for s in samples:
+        if s.episode_id is None:
+            raise ValueError(
+                "temporal mode needs episode_id/frame_idx on every sample; this "
+                "extractor produced single-frame samples (use --mode static)")
+        by_ep[(s.attack, s.checkpoint, s.episode_id)].append(s)
+
+    episodes = []
+    for (attack, ckpt, ep_id), frames in by_ep.items():
+        frames.sort(key=lambda x: x.frame_idx)
+        scores = [ftt_score(f.attn_text_image) for f in frames]
+        # An episode counts as triggered if ANY frame in it is triggered --
+        # for a delayed trigger most of its frames are legitimately clean.
+        label = int(any(f.label == 1 for f in frames))
+        act = next((f.activation_frame for f in frames
+                    if f.activation_frame is not None), None)
+        episodes.append({"scores": scores, "label": label, "activation_frame": act,
+                         "attack": attack, "checkpoint": ckpt, "episode_id": ep_id})
+
+    results = {}
+    by_attack = defaultdict(list)
+    for ep in episodes:
+        by_attack[(ep["attack"], ep["checkpoint"])].append(ep)
+
+    for (attack, ckpt), eps in by_attack.items():
+        r = summarize_episodes(eps, cfg)
+        key = f"{attack}::{Path(ckpt).name}"
+        results[key] = r
+        print(f"\n[{key}]  (Stage 2 / temporal)")
+        print(f"    episodes: {r['n_clean_episodes']} clean, "
+              f"{r['n_triggered_episodes']} triggered")
+        print(f"    episode AUROC     : {r['episode_auroc']:.4f}")
+        print(f"    detection rate    : {r['detection_rate']:.3f}")
+        print(f"    false alarm rate  : {r['false_alarm_rate']:.3f}  (per clean episode)")
+        print(f"    median latency    : {r['median_latency_frames']} frames "
+              f"(n={r['n_latency_samples']})")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
