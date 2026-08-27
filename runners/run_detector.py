@@ -119,12 +119,13 @@ def run_stage1(samples, args):
         used = frames[: args.n_frames] if args.n_frames else frames
         score = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
         label = int(any(f.label == 1 for f in frames))
-        by_group[(attack, ckpt, role, suite)].append((score, label, len(used)))
+        by_group[(attack, ckpt, role, suite)].append(
+            (score, label, len(used), ep_id, frames[0].task_id, frames[0].seed))
 
     results = {}
     for (attack, ckpt, role, suite), rows in sorted(by_group.items(), key=lambda kv: str(kv[0])):
-        clean = [sc for sc, lb, _ in rows if lb == 0]
-        trig = [sc for sc, lb, _ in rows if lb == 1]
+        clean = [sc for sc, lb, *_ in rows if lb == 0]
+        trig = [sc for sc, lb, *_ in rows if lb == 1]
         auroc = auroc_both_polarities(clean, trig)
         key = f"{attack}::{suite}::{role}"
         n_used = rows[0][2] if rows else 0
@@ -141,6 +142,15 @@ def run_stage1(samples, args):
             # by whichever direction scores higher on this data. Picking
             # post-hoc would inflate a near-chance result.
             "auroc_reported": auroc["low_is_backdoor"],
+            # Per-sample scores, not just the aggregate -- every episode's
+            # FTT value, traceable back to (task_id, seed) so any point in
+            # the paper's table/figure can be checked against a specific
+            # extracted sample rather than trusted on the mean alone.
+            "samples": [
+                {"task_id": tid, "seed": sd, "label": lb, "episode_id": eid,
+                 "avg_ftt": sc, "frames_averaged": n_used}
+                for sc, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[4], r[5], r[1]))
+            ],
         }
         r = results[key]
         print(f"\n[{key}]")
@@ -149,6 +159,11 @@ def run_stage1(samples, args):
         print(f"    FTT mean: clean={r['clean_mean']:.5f}  trigger={r['trig_mean']:.5f}")
         print(f"    AUROC (low=backdoor, a priori) : {r['auroc_reported']:.4f}")
         print(f"    AUROC (high=backdoor, diagnostic): {auroc['high_is_backdoor']:.4f}")
+
+        print(f"    -- per-sample avg FTT (mean over {n_used} frames each) --")
+        for sc, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[1], r[4], r[5])):
+            cond = "trigger" if lb == 1 else "clean  "
+            print(f"      {cond}  task={tid:2d} seed={sd:2d}  avg_ftt={sc:.5f}   {eid}")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
