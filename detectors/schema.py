@@ -54,14 +54,24 @@ class ExtractedSample:
     # ORACLE LABEL ONLY -- for scoring detection latency. Never an input to
     # any detector; a detector that reads this is cheating.
     activation_frame: Optional[int] = None
+    # BadVLA-OFT only: text x wrist-camera patches, same forward as
+    # attn_text_image (primary). None for GoBA / single-camera OpenVLA.
+    attn_text_image_wrist: Optional[np.ndarray] = None
 
     extra: dict = field(default_factory=dict)
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        meta = {k: v for k, v in asdict(self).items() if k != "attn_text_image"}
-        np.savez_compressed(path, attn_text_image=self.attn_text_image.astype(np.float32),
-                            schema_version=SCHEMA_VERSION, meta_json=_to_json(meta))
+        skip = {"attn_text_image", "attn_text_image_wrist"}
+        meta = {k: v for k, v in asdict(self).items() if k not in skip}
+        payload = dict(
+            attn_text_image=self.attn_text_image.astype(np.float32),
+            schema_version=SCHEMA_VERSION,
+            meta_json=_to_json(meta),
+        )
+        if self.attn_text_image_wrist is not None:
+            payload["attn_text_image_wrist"] = self.attn_text_image_wrist.astype(np.float32)
+        np.savez_compressed(path, **payload)
 
     @classmethod
     def load(cls, path: str) -> "ExtractedSample":
@@ -69,7 +79,8 @@ class ExtractedSample:
         if int(z["schema_version"]) != SCHEMA_VERSION:
             raise ValueError(f"{path}: schema_version {z['schema_version']} != {SCHEMA_VERSION}")
         meta = _from_json(str(z["meta_json"]))
-        return cls(attn_text_image=z["attn_text_image"], **meta)
+        wrist = z["attn_text_image_wrist"] if "attn_text_image_wrist" in z.files else None
+        return cls(attn_text_image=z["attn_text_image"], attn_text_image_wrist=wrist, **meta)
 
 
 def _to_json(d: dict) -> str:

@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from detectors.ftt import auroc_both_polarities, ftt_score, row_normalize
+from detectors.ftt import auroc, ftt_score, row_normalize
 from detectors.schema import ExtractedSample, load_dir
 
 
@@ -57,12 +57,26 @@ def test_schema_roundtrip(tmp_path=Path("/tmp/vla_bd_defense_test")):
     shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_schema_wrist_roundtrip(tmp_path=Path("/tmp/vla_bd_defense_test_wrist")):
+    shutil.rmtree(tmp_path, ignore_errors=True)
+    tmp_path.mkdir(parents=True)
+    s = ExtractedSample(
+        attn_text_image=np.random.rand(4, 16).astype(np.float32),
+        attn_text_image_wrist=np.random.rand(4, 16).astype(np.float32),
+        label=0, attack="badvla", checkpoint="ckpt", trigger_type="none",
+        task_id=0, seed=1, layer=-1, n_cameras=2, patches_per_camera=16,
+    )
+    s.save(str(tmp_path / "sample.npz"))
+    r = load_dir(str(tmp_path))[0]
+    assert np.allclose(r.attn_text_image, s.attn_text_image)
+    assert np.allclose(r.attn_text_image_wrist, s.attn_text_image_wrist)
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_auroc_recovers_known_separation():
     clean = [0.09, 0.10, 0.11, 0.095]
     trig = [0.01, 0.02, 0.015, 0.018]
-    auroc = auroc_both_polarities(clean, trig)
-    assert auroc["low_is_backdoor"] == 1.0
-    assert auroc["high_is_backdoor"] == 0.0
+    assert auroc(clean, trig) == 1.0
 
 
 if __name__ == "__main__":

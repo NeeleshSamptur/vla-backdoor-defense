@@ -214,23 +214,22 @@ def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, tri
     # in this file (full/primary first, wrist second) -- not yet verified by
     # actually visualizing which patch maps to which pixel on a running
     # model. Do that sanity check before trusting downstream numbers.
-    if camera == "primary":
-        img_cols = list(range(1, 1 + num_patches))
-    elif camera == "wrist":
-        img_cols = list(range(1 + num_patches, 1 + n_img_cols))
-    else:  # "both"
-        img_cols = list(range(1, 1 + n_img_cols))
-
-    # Only the primary camera is ever actually poisoned (see this file's
-    # module docstring), so restricting FTT to those columns targets the
-    # statistic at the camera that can carry a trigger, rather than diluting
-    # it with the wrist camera's untouched patches.
     txt_rows = list(range(1 + n_img_cols, 1 + n_img_cols + n_txt))
     A_last = out.attentions[-1][0].float().mean(0)
-    rows = A_last[txt_rows][:, img_cols].cpu().numpy()
+    primary_cols = list(range(1, 1 + num_patches))
+    wrist_cols = list(range(1 + num_patches, 1 + n_img_cols))
+    both_cols = list(range(1, 1 + n_img_cols))
+    rows_primary = A_last[txt_rows][:, primary_cols].cpu().numpy()
+    rows_wrist = A_last[txt_rows][:, wrist_cols].cpu().numpy()
+    if camera == "wrist":
+        rows_main = rows_wrist
+    elif camera == "both":
+        rows_main = A_last[txt_rows][:, both_cols].cpu().numpy()
+    else:
+        rows_main = rows_primary
     del out
     torch.cuda.empty_cache()
-    return rows, num_patches
+    return rows_main, rows_primary, rows_wrist, num_patches
 
 
 def main():
@@ -243,7 +242,9 @@ def main():
                          "to sweep all four in one call.")
     ap.add_argument("--role", required=True, choices=["attack", "clean_baseline"])
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--n-tasks", type=int, default=10)
+    ap.add_argument("--n-tasks", type=int, default=10,
+                    help="tasks per suite (LIBERO suites have 10). MUST stay in "
+                         "lockstep with adapters/goba and run_all_suites.sh.")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--trigger-size", type=float, default=0.10)
     ap.add_argument("--layer", type=int, default=-1, help="LLM layer index for attention (-1 = last)")
@@ -251,7 +252,12 @@ def main():
                     help="which camera's patch columns to keep for FTT. 'primary' "
                          "(default) is the camera that actually gets poisoned -- see "
                          "text2img_rows' docstring on training-time camera targeting.")
-    ap.add_argument("--n-seeds", type=int, default=1, help="episodes per task, seed=base_seed+k")
+    ap.add_argument("--n-seeds", type=int, default=10,
+                    help="episodes per task per condition. MUST stay in lockstep "
+                         "with adapters/goba (same default) and with "
+                         "run_all_suites.sh's ${N_SEEDS:-10} -- a bare "
+                         "`python extract_text2img_ftt.py` with no flag must "
+                         "produce the same episode count as the paper sweep.")
     ap.add_argument("--n-frames", type=int, default=5,
                     help="number of policy FORWARD PASSES per episode (Stage 1 "
                          "averages FTT over these). Each pass yields one attention "
@@ -386,11 +392,11 @@ def main():
                 frames_rows = []
                 for pass_idx in range(args.n_frames):
                     observation, _ = prepare_observation(obs, resize_size)
-                    rows, num_patches = text2img_rows(
+                    _main, rows_primary, rows_wrist, num_patches = text2img_rows(
                         vla, processor, proprio_projector, cfg, observation, desc,
                         trig, args.trigger_size, camera=args.camera,
                         trigger_cameras=args.trigger_cameras)
-                    frames_rows.append(rows)
+                    frames_rows.append((rows_primary, rows_wrist))
 
                     if pass_idx == args.n_frames - 1:
                         break  # no need to advance the sim after the last map
@@ -422,9 +428,9 @@ def main():
                         # rather than padding with post-termination frames.
                         break
 
-                for frame_idx, rows in enumerate(frames_rows):
+                for frame_idx, (rows_primary, rows_wrist) in enumerate(frames_rows):
                     sample = ExtractedSample(
-                        attn_text_image=rows,
+                        attn_text_image=rows_primary,
                         label=int(trig),
                         attack="badvla",
                         checkpoint=args.checkpoint,
@@ -433,15 +439,18 @@ def main():
                         n_cameras=2, patches_per_camera=num_patches,
                         episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
                         frame_idx=frame_idx,
+                        attn_text_image_wrist=rows_wrist,
                         extra={"role": args.role, "camera": args.camera,
                               "task_suite_name": args.task_suite_name,
-                              "trigger_cameras": args.trigger_cameras},
+                              "trigger_cameras": args.trigger_cameras,
+                              "ftt_cameras": "primary_and_wrist"},
                     )
                     fname = (out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
                                        f"__s{seed}__{cond}__f{frame_idx}.npz")
                     sample.save(str(fname))
                 print(f"    task={task_id} seed={seed} {cond:8s} "
-                      f"{len(frames_rows)} frame(s), rows={frames_rows[0].shape}")
+                      f"{len(frames_rows)} frame(s), "
+                      f"primary={rows_primary.shape} wrist={rows_wrist.shape}")
         env.close()
 
     del vla, processor, proprio_projector, action_head

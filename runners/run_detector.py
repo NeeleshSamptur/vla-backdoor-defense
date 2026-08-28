@@ -23,7 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from detectors.ftt import auroc_both_polarities, ftt_score  # noqa: E402
+from detectors.ftt import auroc, ftt_score  # noqa: E402
 from detectors.schema import load_dir  # noqa: E402
 from detectors.temporal import TemporalConfig, summarize_episodes  # noqa: E402
 
@@ -70,17 +70,13 @@ def main():
         trig = [s for s in group if s.label == 1]
         clean_scores = [ftt_score(s.attn_text_image) for s in clean]
         trig_scores = [ftt_score(s.attn_text_image) for s in trig]
-        auroc = auroc_both_polarities(clean_scores, trig_scores)
-
-        best_polarity = "low_is_backdoor" if auroc["low_is_backdoor"] >= auroc["high_is_backdoor"] else "high_is_backdoor"
+        auroc_val = auroc(clean_scores, trig_scores)
         results[key] = {
             "attack": attack, "role": role,
             "n_clean": len(clean), "n_trigger": len(trig),
             "clean_mean": float(sum(clean_scores) / max(len(clean_scores), 1)),
             "trig_mean": float(sum(trig_scores) / max(len(trig_scores), 1)),
-            "auroc": auroc,
-            "best_polarity": best_polarity,
-            "best_auroc": auroc[best_polarity],
+            "auroc": auroc_val,
             "checkpoint": group[0].checkpoint,
             "trigger_type": group[0].trigger_type,
         }
@@ -88,9 +84,7 @@ def main():
         print(f"\n[{key}] n_clean={r['n_clean']} n_trigger={r['n_trigger']} "
               f"trigger={r['trigger_type']}")
         print(f"    clean_mean={r['clean_mean']:.4f}  trig_mean={r['trig_mean']:.4f}")
-        print(f"    AUROC(high=backdoor)={auroc['high_is_backdoor']:.4f}  "
-              f"AUROC(low=backdoor)={auroc['low_is_backdoor']:.4f}")
-        print(f"    => best polarity: {best_polarity}  (AUROC={r['best_auroc']:.4f})")
+        print(f"    AUROC(low=backdoor)={auroc_val:.4f}")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -117,53 +111,76 @@ def run_stage1(samples, args):
     for (attack, ckpt, role, suite, ep_id), frames in by_ep.items():
         frames.sort(key=lambda x: x.frame_idx)
         used = frames[: args.n_frames] if args.n_frames else frames
-        score = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
+        score_p = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
+        has_wrist = all(f.attn_text_image_wrist is not None for f in used)
+        score_w = (float(np.mean([ftt_score(f.attn_text_image_wrist) for f in used]))
+                   if has_wrist else None)
+        # Fuse cameras by averaging the two FTT scores (not min, not concat
+        # of patch columns). Each view is scored on its own map, then combined
+        # so one noisy camera cannot dominate. GoBA / one-cam has no wrist.
+        score_both = (0.5 * (score_p + score_w)) if score_w is not None else score_p
         label = int(any(f.label == 1 for f in frames))
         by_group[(attack, ckpt, role, suite)].append(
-            (score, label, len(used), ep_id, frames[0].task_id, frames[0].seed))
+            (score_p, score_w, score_both, label, len(used), ep_id,
+             frames[0].task_id, frames[0].seed))
 
     results = {}
     for (attack, ckpt, role, suite), rows in sorted(by_group.items(), key=lambda kv: str(kv[0])):
-        clean = [sc for sc, lb, *_ in rows if lb == 0]
-        trig = [sc for sc, lb, *_ in rows if lb == 1]
-        auroc = auroc_both_polarities(clean, trig)
+        clean_p = [p for p, w, o, lb, *_ in rows if lb == 0]
+        trig_p = [p for p, w, o, lb, *_ in rows if lb == 1]
+        auroc_p = auroc(clean_p, trig_p)
+        has_wrist = rows[0][1] is not None
+        auroc_w = auroc_fused = None
+        if has_wrist:
+            clean_w = [w for p, w, o, lb, *_ in rows if lb == 0]
+            trig_w = [w for p, w, o, lb, *_ in rows if lb == 1]
+            clean_both = [o for p, w, o, lb, *_ in rows if lb == 0]
+            trig_both = [o for p, w, o, lb, *_ in rows if lb == 1]
+            auroc_w = auroc(clean_w, trig_w)
+            auroc_fused = auroc(clean_both, trig_both)
         key = f"{attack}::{suite}::{role}"
-        n_used = rows[0][2] if rows else 0
+        n_used = rows[0][4] if rows else 0
         results[key] = {
             "attack": attack, "suite": suite, "role": role,
             "checkpoint": ckpt,
-            "n_clean_episodes": len(clean), "n_trigger_episodes": len(trig),
+            "n_clean_episodes": len(clean_p), "n_trigger_episodes": len(trig_p),
             "frames_averaged": n_used,
-            "clean_mean": float(np.mean(clean)) if clean else float("nan"),
-            "trig_mean": float(np.mean(trig)) if trig else float("nan"),
-            "auroc": auroc,
-            # Polarity is FIXED A PRIORI to T2IShield's convention
-            # (assimilation => LOW FTT when a trigger is present), NOT chosen
-            # by whichever direction scores higher on this data. Picking
-            # post-hoc would inflate a near-chance result.
-            "auroc_reported": auroc["low_is_backdoor"],
-            # Per-sample scores, not just the aggregate -- every episode's
-            # FTT value, traceable back to (task_id, seed) so any point in
-            # the paper's table/figure can be checked against a specific
-            # extracted sample rather than trusted on the mean alone.
+            "primary": {
+                "clean_mean": float(np.mean(clean_p)) if clean_p else float("nan"),
+                "trig_mean": float(np.mean(trig_p)) if trig_p else float("nan"),
+                "auroc": auroc_p,
+            },
+            "wrist": None if not has_wrist else {
+                "clean_mean": float(np.mean(clean_w)),
+                "trig_mean": float(np.mean(trig_w)),
+                "auroc": auroc_w,
+            },
+            "both_mean": None if not has_wrist else {
+                "clean_mean": float(np.mean(clean_both)),
+                "trig_mean": float(np.mean(trig_both)),
+                "auroc": auroc_fused,
+            },
+            # Headline: fused mean of the two cameras when wrist is present;
+            # primary-only for GoBA / one-cam extracts. AUROC is low FTT = backdoor.
+            "score_used": "both_mean" if has_wrist else "primary",
+            "clean_mean": float(np.mean(clean_both if has_wrist else clean_p)) if clean_p else float("nan"),
+            "trig_mean": float(np.mean(trig_both if has_wrist else trig_p)) if trig_p else float("nan"),
+            "auroc": auroc_fused if has_wrist else auroc_p,
             "samples": [
                 {"task_id": tid, "seed": sd, "label": lb, "episode_id": eid,
-                 "avg_ftt": sc, "frames_averaged": n_used}
-                for sc, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[4], r[5], r[1]))
+                 "avg_ftt_primary": p, "avg_ftt_wrist": w, "avg_ftt_both_mean": o,
+                 "frames_averaged": n_used}
+                for p, w, o, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[6], r[7], r[3]))
             ],
         }
         r = results[key]
         print(f"\n[{key}]")
-        print(f"    episodes: {r['n_clean_episodes']} clean, {r['n_trigger_episodes']} trigger "
-              f"({n_used} frames averaged each)")
-        print(f"    FTT mean: clean={r['clean_mean']:.5f}  trigger={r['trig_mean']:.5f}")
-        print(f"    AUROC (low=backdoor, a priori) : {r['auroc_reported']:.4f}")
-        print(f"    AUROC (high=backdoor, diagnostic): {auroc['high_is_backdoor']:.4f}")
-
-        print(f"    -- per-sample avg FTT (mean over {n_used} frames each) --")
-        for sc, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[1], r[4], r[5])):
+        print(f"    AUROC={r['auroc']:.4f}  ({r['score_used']})  "
+              f"clean_mean={r['clean_mean']:.5f}  trigger_mean={r['trig_mean']:.5f}")
+        for p, w, o, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[3], r[6], r[7])):
             cond = "trigger" if lb == 1 else "clean  "
-            print(f"      {cond}  task={tid:2d} seed={sd:2d}  avg_ftt={sc:.5f}   {eid}")
+            ftt = o if w is not None else p
+            print(f"      {cond}  task={tid:2d} seed={sd:2d}  ftt={ftt:.5f}   {eid}")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)

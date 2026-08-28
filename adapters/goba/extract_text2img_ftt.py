@@ -329,9 +329,13 @@ def main():
     ap.add_argument("--task-suite-name", required=True, choices=VALID_SUITES)
     ap.add_argument("--role", required=True, choices=["attack", "clean_baseline"])
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--n-tasks", type=int, default=10)
+    ap.add_argument("--n-tasks", type=int, default=10,
+                    help="tasks per suite (LIBERO suites have 10). MUST stay in "
+                         "lockstep with adapters/badvla_white_patch and run_all_suites.sh.")
     ap.add_argument("--n-seeds", type=int, default=10,
-                    help="episodes per task per condition")
+                    help="episodes per task per condition. MUST stay in lockstep "
+                         "with adapters/badvla_white_patch (same default) and with "
+                         "run_all_suites.sh's ${N_SEEDS:-10}.")
     ap.add_argument("--seed", type=int, default=7,
                     help="env construction seed; GoBA's eval.sh sweeps 7/42/1234")
     ap.add_argument("--n-frames", type=int, default=5,

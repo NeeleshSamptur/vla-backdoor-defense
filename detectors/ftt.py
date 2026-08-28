@@ -12,10 +12,7 @@ your own BadVLA script, experiments/robot/libero/run_kl_vs_ftt_text2img.py
 
 T2IShield's polarity: backdoor <=> LOW FTT (a trigger token drags every other
 text token's attention toward the same pattern -- the "Assimilation
-Phenomenon"). This module reports AUROC under both polarities so the sign is
-verified against data, not assumed -- confirmed on BadVLA's real pixel trigger
-(low=backdoor) in the bera prototype this repo replaces the exploratory parts
-of; that polarity should hold here too, but re-check per attack, don't assume.
+Phenomenon"). AUROC is computed under that convention only.
 
 No torch/transformers dependency -- pure numpy/sklearn, exactly the
 "detectors never import torch" rule this repo is built around.
@@ -40,11 +37,10 @@ def ftt_score(attn_text_image: np.ndarray) -> float:
     return float(np.linalg.norm(P - high_atm[None, :], axis=1).mean())
 
 
-def auroc_both_polarities(clean_scores, trig_scores) -> dict:
-    """AUROC with label 1 = triggered, both sign conventions.
+def auroc(clean_scores, trig_scores) -> float:
+    """AUROC with label 1 = triggered and low FTT = backdoor.
 
-    T2IShield's convention is `low_is_backdoor`; report both because a port to
-    a new architecture/attack should not assume the polarity transfers.
+    sklearn's roc_auc_score treats higher score as class 1, so we pass -FTT.
     """
     from sklearn.metrics import roc_auc_score
 
@@ -53,8 +49,5 @@ def auroc_both_polarities(clean_scores, trig_scores) -> dict:
     y = np.concatenate([np.ones(len(t)), np.zeros(len(c))])
     s = np.concatenate([t, c])
     if len(np.unique(y)) < 2 or len(c) == 0 or len(t) == 0:
-        return {"high_is_backdoor": float("nan"), "low_is_backdoor": float("nan")}
-    return {
-        "high_is_backdoor": float(roc_auc_score(y, s)),
-        "low_is_backdoor": float(roc_auc_score(y, -s)),
-    }
+        return float("nan")
+    return float(roc_auc_score(y, -s))

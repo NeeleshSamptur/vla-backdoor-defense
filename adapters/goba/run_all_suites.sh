@@ -8,6 +8,11 @@
 # ("GoBA -- Physical Object (Toxic Box) Trigger"). If that file changes,
 # update ATTACK_CKPT below -- it is not read automatically.
 #
+# Locked evaluation protocol -- MUST match adapters/badvla_white_patch/run_all_suites.sh
+# (same counts; only env/trigger/checkpoint differ):
+#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions x 5 frames
+#   eval-design=disjoint, BASE_SEED=7, both roles (attack + clean_baseline)
+#
 # Usage:
 #   ./run_all_suites.sh
 #   GPU_ID=2 SUITES="libero_goal" ./run_all_suites.sh
@@ -75,6 +80,7 @@ for suite in ${SUITES}; do
       --task-suite-name "${suite}" \
       --role "${role}" \
       --out-dir "${OUT_DIR}" \
+      --n-tasks "${N_TASKS:-10}" \
       --n-seeds "${N_SEEDS:-10}" \
       --n-frames "${N_FRAMES:-5}" \
       --eval-design "${EVAL_DESIGN:-disjoint}" \
