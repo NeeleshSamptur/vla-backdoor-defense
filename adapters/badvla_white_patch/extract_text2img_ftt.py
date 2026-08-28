@@ -331,22 +331,10 @@ def main():
         init_states = suite.get_task_init_states(task_id)
         n_avail = init_states.shape[0]
 
-        # PAIRED by default: clean and trigger draw the SAME init-state index,
-        # differing only in whether the patch is overlaid. This is the correct
-        # main-table design, not a weaker one -- it is literally what the
-        # attack's own ASR/SR definition measures (same trial, overlay on vs
-        # off), and it isolates the ONE variable under test. A reviewer cannot
-        # dismiss AUROC=1.0 here as "the layout changed", because the layout
-        # didn't: only the patch did.
-        #
-        # An earlier revision of this file used disjoint indices (clean
-        # [base,base+n_seeds), trigger [base+n_seeds,base+2*n_seeds)) as the
-        # DEFAULT. That was wrong to use as the main result: two different
-        # scenes confounds "trigger response" with "scene difference", which
-        # is the weaker, easier-to-dismiss experiment, not the stronger one.
-        # --eval-design disjoint keeps that available as an explicit opt-in
-        # secondary column (a genuinely harder test worth reporting
-        # ADDITIONALLY), never silently replacing the paired main result.
+        # Scene pairing vs disjoint is --eval-design (default DISJOINT, same as
+        # argparse and run_all_suites.sh). paired: clean and trigger use the
+        # SAME curated init-state index, differing only in the pixel overlay.
+        # disjoint: trigger uses indices offset by n_seeds.
         if args.eval_design == "paired":
             cond_offset = {"clean": 0, "trigger": 0}
         else:
