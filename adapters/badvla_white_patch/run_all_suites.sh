@@ -11,7 +11,8 @@
 #
 # Locked evaluation protocol -- MUST match adapters/goba/run_all_suites.sh
 # (same counts; only env/trigger/checkpoint differ):
-#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions x 5 frames
+#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions
+#   (one first-frame attention map per episode)
 #   eval-design=disjoint, BASE_SEED=7, both roles (attack + clean_baseline)
 #
 # Usage:
@@ -87,7 +88,6 @@ for suite in ${SUITES}; do
       --n-tasks "${N_TASKS:-10}" \
       --n-seeds "${N_SEEDS:-10}" \
       --eval-design "${EVAL_DESIGN:-disjoint}" \
-      --n-frames "${N_FRAMES:-5}" \
       --seed "${BASE_SEED:-7}"
   done
 done
@@ -95,13 +95,5 @@ done
 echo
 echo "Done. Extracted samples -> ${OUT_DIR}"
 echo "Run detection with:"
-# NOT --mode static: this extractor's episodes are multi-frame (n_frames
-# passes each), and static scores every frame independently with no
-# per-episode averaging or grouping -- it silently ignores the whole point
-# of Stage 1's within-episode averaging. --mode stage1 groups by episode_id,
-# averages FTT over the leading N_FRAMES passes, and prints/saves the
-# per-sample avg_ftt values. Keep this in sync with N_FRAMES above if it
-# changes; the two can silently drift the same way --eval-design's defaults
-# once did.
-echo "  cd ${DEFENSE} && python runners/run_detector.py --mode stage1 --n-frames ${N_FRAMES:-5} \\"
+echo "  cd ${DEFENSE} && python runners/run_detector.py --mode stage1 \\"
 echo "      --samples-dir ${OUT_DIR} --out results/ftt_badvla_stage1.json"

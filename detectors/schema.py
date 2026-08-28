@@ -40,13 +40,10 @@ class ExtractedSample:
     n_cameras: int = 1
     patches_per_camera: Optional[int] = None
 
-    # --- temporal fields (Stage 2) ---------------------------------------
-    # Both current adapters (badvla_white_patch, goba) are MULTI-FRAME: each
-    # episode is n_frames closed-loop policy queries, so they set these and
-    # are scored with --mode stage1. A hypothetical single-frame extractor may
-    # leave them at their defaults and use --mode static. Attacks whose trigger
-    # appears partway through a rollout (DropVLA) additionally need
-    # activation_frame, so the temporal detector can reconstruct each episode.
+    # --- temporal fields (Stage 2 / DropVLA) -----------------------------
+    # Stage 1 extractors (BadVLA, GoBA) write one .npz per episode
+    # (frame_idx=0). Delayed-trigger attacks additionally set
+    # activation_frame so the temporal detector can reconstruct a rollout.
     episode_id: Optional[str] = None   # groups frames from the same rollout
     frame_idx: int = 0                 # position within that rollout
     # Ground-truth frame at which the trigger actually became visible, from

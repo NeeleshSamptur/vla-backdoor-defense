@@ -84,11 +84,15 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.vla.constants import IGNORE_INDEX
 
 from experiments.robot.libero.libero_utils import get_libero_dummy_action, get_libero_env
-from experiments.robot.libero.run_libero_eval import add_trigger_img, prepare_observation, process_action
+from experiments.robot.libero.run_libero_eval import add_trigger_img, prepare_observation
+# Closed-loop (5-pass) extract also needs:
+#   process_action from run_libero_eval
+#   get_action_head from openvla_utils
+#   get_action from robot_utils
 from experiments.robot.openvla_utils import (
-    get_action_head, get_proprio_projector, normalize_proprio, prepare_images_for_vla,
+    get_proprio_projector, normalize_proprio, prepare_images_for_vla,
 )
-from experiments.robot.robot_utils import get_action, get_image_resize_size
+from experiments.robot.robot_utils import get_image_resize_size
 
 from detectors.schema import ExtractedSample  # from the new repo, added to sys.path above
 
@@ -108,11 +112,10 @@ class Cfg:
     model_family: str = "openvla"
     env_img_res: int = 256
     unnorm_key: str = ""  # set explicitly in main() from --task-suite-name
-    # Required by get_action()/get_action_head(); values match BadVLA's own
-    # eval defaults for these checkpoints (L1 regression head, no diffusion).
-    use_l1_regression: bool = True
-    use_diffusion: bool = False
-    num_open_loop_steps: int = 8
+    # Closed-loop extract (commented below) also needs:
+    # use_l1_regression: bool = True
+    # use_diffusion: bool = False
+    # num_open_loop_steps: int = 8
 
 
 def load_vla(ckpt, cfg):
@@ -133,9 +136,10 @@ def load_vla(ckpt, cfg):
         cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
     proprio_projector = get_proprio_projector(cfg, vla.llm_dim, proprio_dim=8)
     proprio_projector = proprio_projector.to(DEVICE, dtype=torch.bfloat16).eval()
-    # Needed to produce executable actions for the closed-loop rollout.
-    action_head = get_action_head(cfg, vla.llm_dim)
-    return processor, vla, proprio_projector, action_head
+    # Closed-loop extract:
+    # action_head = get_action_head(cfg, vla.llm_dim)
+    # return processor, vla, proprio_projector, action_head
+    return processor, vla, proprio_projector
 
 
 def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, trigger, trigger_size,
@@ -258,11 +262,9 @@ def main():
                          "run_all_suites.sh's ${N_SEEDS:-10} -- a bare "
                          "`python extract_text2img_ftt.py` with no flag must "
                          "produce the same episode count as the paper sweep.")
-    ap.add_argument("--n-frames", type=int, default=5,
-                    help="number of policy FORWARD PASSES per episode (Stage 1 "
-                         "averages FTT over these). Each pass yields one attention "
-                         "map; OFT executes NUM_ACTIONS_CHUNK actions between passes, "
-                         "so this is not the same as env timesteps.")
+    # Closed-loop extract (5 policy passes / episode; Stage 1 used to average):
+    # ap.add_argument("--n-frames", type=int, default=5,
+    #                 help="number of policy FORWARD PASSES per episode.")
     ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="disjoint",
                     help="'disjoint' (DEFAULT, MAIN RESULT per professor's direction): "
                          "clean and trigger draw DIFFERENT curated init-state indices "
@@ -296,7 +298,7 @@ def main():
 
     cfg = Cfg(pretrained_checkpoint=args.checkpoint, unnorm_key=args.task_suite_name)
     print(f"[*] loading {args.checkpoint} (role={args.role}, suite={args.task_suite_name})")
-    processor, vla, proprio_projector, action_head = load_vla(args.checkpoint, cfg)
+    processor, vla, proprio_projector = load_vla(args.checkpoint, cfg)
     resize_size = get_image_resize_size(cfg)
 
     suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
@@ -382,78 +384,84 @@ def main():
                 for _ in range(NUM_STEPS_WAIT):
                     obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
 
-                # Closed-loop rollout. Each pass = one policy query = one
-                # attention map = one FTT value. OFT returns NUM_ACTIONS_CHUNK
-                # actions per query, all of which are executed before the next
-                # query, mirroring run_libero_eval.py's action-queue logic --
-                # so N passes advance the sim by N*chunk steps, not N steps.
-                # This is why "5 frames" must mean 5 PASSES, not 5 timesteps:
-                # timesteps 0-7 all fall inside pass #1 and share one map.
-                frames_rows = []
-                for pass_idx in range(args.n_frames):
-                    observation, _ = prepare_observation(obs, resize_size)
-                    _main, rows_primary, rows_wrist, num_patches = text2img_rows(
-                        vla, processor, proprio_projector, cfg, observation, desc,
-                        trig, args.trigger_size, camera=args.camera,
-                        trigger_cameras=args.trigger_cameras)
-                    frames_rows.append((rows_primary, rows_wrist))
+                # One attention map per episode: first policy query after the
+                # 10-step settle (same as eval), no closed-loop rollout.
+                observation, _ = prepare_observation(obs, resize_size)
+                _main, rows_primary, rows_wrist, num_patches = text2img_rows(
+                    vla, processor, proprio_projector, cfg, observation, desc,
+                    trig, args.trigger_size, camera=args.camera,
+                    trigger_cameras=args.trigger_cameras)
 
-                    if pass_idx == args.n_frames - 1:
-                        break  # no need to advance the sim after the last map
-
-                    # Re-apply the trigger to what the POLICY sees, so the
-                    # rollout it produces is the triggered trajectory (not a
-                    # clean one we merely observed through a triggered lens).
-                    act_obs = dict(observation)
-                    if trig:
-                        act_obs["full_image"] = add_trigger_img(
-                            act_obs["full_image"], trigger_size=args.trigger_size,
-                            trigger_position="center", trigger_color=255)
-                        if args.trigger_cameras == "both":
-                            act_obs["wrist_image"] = add_trigger_img(
-                                act_obs["wrist_image"], trigger_size=args.trigger_size,
-                                trigger_position="center", trigger_color=255)
-
-                    actions = get_action(
-                        cfg, vla, act_obs, desc, processor=processor,
-                        action_head=action_head, proprio_projector=proprio_projector,
-                        noisy_action_projector=None, use_film=cfg.use_film)
-                    done = False
-                    for a in actions:
-                        obs, _, done, _ = env.step(process_action(a, cfg.model_family).tolist())
-                        if done:
-                            break
-                    if done:
-                        # Episode ended early; keep the maps gathered so far
-                        # rather than padding with post-termination frames.
-                        break
-
-                for frame_idx, (rows_primary, rows_wrist) in enumerate(frames_rows):
-                    sample = ExtractedSample(
-                        attn_text_image=rows_primary,
-                        label=int(trig),
-                        attack="badvla",
-                        checkpoint=args.checkpoint,
-                        trigger_type=f"pixel_white_square_{args.trigger_size:.2f}" if trig else "none",
-                        task_id=task_id, seed=seed, layer=args.layer,
-                        n_cameras=2, patches_per_camera=num_patches,
-                        episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
-                        frame_idx=frame_idx,
-                        attn_text_image_wrist=rows_wrist,
-                        extra={"role": args.role, "camera": args.camera,
-                              "task_suite_name": args.task_suite_name,
-                              "trigger_cameras": args.trigger_cameras,
-                              "ftt_cameras": "primary_and_wrist"},
-                    )
-                    fname = (out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
-                                       f"__s{seed}__{cond}__f{frame_idx}.npz")
-                    sample.save(str(fname))
+                sample = ExtractedSample(
+                    attn_text_image=rows_primary,
+                    label=int(trig),
+                    attack="badvla",
+                    checkpoint=args.checkpoint,
+                    trigger_type=f"pixel_white_square_{args.trigger_size:.2f}" if trig else "none",
+                    task_id=task_id, seed=seed, layer=args.layer,
+                    n_cameras=2, patches_per_camera=num_patches,
+                    episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
+                    frame_idx=0,
+                    attn_text_image_wrist=rows_wrist,
+                    extra={"role": args.role, "camera": args.camera,
+                          "task_suite_name": args.task_suite_name,
+                          "trigger_cameras": args.trigger_cameras,
+                          "ftt_cameras": "primary_and_wrist"},
+                )
+                sample.save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
+                                          f"__s{seed}__{cond}.npz"))
                 print(f"    task={task_id} seed={seed} {cond:8s} "
-                      f"{len(frames_rows)} frame(s), "
                       f"primary={rows_primary.shape} wrist={rows_wrist.shape}")
+                # --- old 5-pass closed-loop extract (kept for reference) ---
+                # frames_rows = []
+                # for pass_idx in range(args.n_frames):
+                #     observation, _ = prepare_observation(obs, resize_size)
+                #     _main, rows_primary, rows_wrist, num_patches = text2img_rows(
+                #         vla, processor, proprio_projector, cfg, observation, desc,
+                #         trig, args.trigger_size, camera=args.camera,
+                #         trigger_cameras=args.trigger_cameras)
+                #     frames_rows.append((rows_primary, rows_wrist))
+                #     if pass_idx == args.n_frames - 1:
+                #         break
+                #     act_obs = dict(observation)
+                #     if trig:
+                #         act_obs["full_image"] = add_trigger_img(
+                #             act_obs["full_image"], trigger_size=args.trigger_size,
+                #             trigger_position="center", trigger_color=255)
+                #         if args.trigger_cameras == "both":
+                #             act_obs["wrist_image"] = add_trigger_img(
+                #                 act_obs["wrist_image"], trigger_size=args.trigger_size,
+                #                 trigger_position="center", trigger_color=255)
+                #     actions = get_action(
+                #         cfg, vla, act_obs, desc, processor=processor,
+                #         action_head=action_head, proprio_projector=proprio_projector,
+                #         noisy_action_projector=None, use_film=cfg.use_film)
+                #     done = False
+                #     for a in actions:
+                #         obs, _, done, _ = env.step(process_action(a, cfg.model_family).tolist())
+                #         if done:
+                #             break
+                #     if done:
+                #         break
+                # for frame_idx, (rows_primary, rows_wrist) in enumerate(frames_rows):
+                #     sample = ExtractedSample(
+                #         attn_text_image=rows_primary, label=int(trig),
+                #         attack="badvla", checkpoint=args.checkpoint,
+                #         trigger_type=f"pixel_white_square_{args.trigger_size:.2f}" if trig else "none",
+                #         task_id=task_id, seed=seed, layer=args.layer,
+                #         n_cameras=2, patches_per_camera=num_patches,
+                #         episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
+                #         frame_idx=frame_idx, attn_text_image_wrist=rows_wrist,
+                #         extra={"role": args.role, "camera": args.camera,
+                #               "task_suite_name": args.task_suite_name,
+                #               "trigger_cameras": args.trigger_cameras,
+                #               "ftt_cameras": "primary_and_wrist"},
+                #     )
+                #     sample.save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
+                #                               f"__s{seed}__{cond}__f{frame_idx}.npz"))
         env.close()
 
-    del vla, processor, proprio_projector, action_head
+    del vla, processor, proprio_projector
     torch.cuda.empty_cache()
     print(f"[*] done -> {out_dir}")
 

@@ -34,17 +34,15 @@ def main():
                     help="directory of .npz files from an attack's extractor")
     ap.add_argument("--out", default=None)
     ap.add_argument("--mode", choices=["static", "stage1", "temporal"], default="static",
-                    help="static = Stage 1, one frame per scene, catches always-on "
-                         "triggers (BadVLA/GoBA). temporal = Stage 2, per-frame "
-                         "monitoring against each episode's own baseline, catches "
-                         "delayed triggers (DropVLA). stage1 = per-EPISODE score, "
-                         "averaging FTT over that episode's first --n-frames forward "
-                         "passes (the two-stage cascade's gate).")
+                    help="static = one score per .npz file. stage1 = one score per "
+                         "episode (first policy query; BadVLA fuses cameras). "
+                         "temporal = Stage 2 delayed-trigger monitoring (DropVLA).")
     ap.add_argument("--n-baseline", type=int, default=8)
     ap.add_argument("--k-persist", type=int, default=3)
     ap.add_argument("--z-threshold", type=float, default=4.0)
-    ap.add_argument("--n-frames", type=int, default=5,
-                    help="stage1: how many of each episode's leading frames to average")
+    # Old Stage 1 averaged FTT over N policy passes per episode:
+    # ap.add_argument("--n-frames", type=int, default=5,
+    #                 help="stage1: how many of each episode's leading frames to average")
     args = ap.parse_args()
 
     samples = load_dir(args.samples_dir)
@@ -93,13 +91,10 @@ def main():
 
 
 def run_stage1(samples, args):
-    """Stage 1: one score per EPISODE = mean FTT over its first N passes.
+    """Stage 1: one FTT per episode from the first (only) policy query.
 
-    Distinct from --mode static, which treats every frame as an independent
-    sample. Averaging within an episode is the point of the gate: it cuts
-    per-frame noise before the clean/trigger decision, and it makes the unit
-    of evaluation an episode (what a deployed defender actually screens),
-    not a frame.
+    Extractors save one .npz per episode after the eval settle. If a directory
+    still has multiple frames, only the lowest frame_idx is used.
     """
     by_ep = defaultdict(list)
     for s in samples:
@@ -110,19 +105,20 @@ def run_stage1(samples, args):
     by_group = defaultdict(list)
     for (attack, ckpt, role, suite, ep_id), frames in by_ep.items():
         frames.sort(key=lambda x: x.frame_idx)
-        used = frames[: args.n_frames] if args.n_frames else frames
-        score_p = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
-        has_wrist = all(f.attn_text_image_wrist is not None for f in used)
-        score_w = (float(np.mean([ftt_score(f.attn_text_image_wrist) for f in used]))
-                   if has_wrist else None)
-        # Fuse cameras by averaging the two FTT scores (not min, not concat
-        # of patch columns). Each view is scored on its own map, then combined
-        # so one noisy camera cannot dominate. GoBA / one-cam has no wrist.
+        f0 = frames[0]
+        score_p = ftt_score(f0.attn_text_image)
+        has_wrist = f0.attn_text_image_wrist is not None
+        score_w = ftt_score(f0.attn_text_image_wrist) if has_wrist else None
+        # Old: mean FTT over the first N frames of the episode
+        # used = frames[: args.n_frames] if args.n_frames else frames
+        # score_p = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
+        # has_wrist = all(f.attn_text_image_wrist is not None for f in used)
+        # score_w = (float(np.mean([ftt_score(f.attn_text_image_wrist) for f in used]))
+        #            if has_wrist else None)
         score_both = (0.5 * (score_p + score_w)) if score_w is not None else score_p
-        label = int(any(f.label == 1 for f in frames))
+        label = int(f0.label)
         by_group[(attack, ckpt, role, suite)].append(
-            (score_p, score_w, score_both, label, len(used), ep_id,
-             frames[0].task_id, frames[0].seed))
+            (score_p, score_w, score_both, label, ep_id, f0.task_id, f0.seed))
 
     results = {}
     for (attack, ckpt, role, suite), rows in sorted(by_group.items(), key=lambda kv: str(kv[0])):
@@ -139,12 +135,10 @@ def run_stage1(samples, args):
             auroc_w = auroc(clean_w, trig_w)
             auroc_fused = auroc(clean_both, trig_both)
         key = f"{attack}::{suite}::{role}"
-        n_used = rows[0][4] if rows else 0
         results[key] = {
             "attack": attack, "suite": suite, "role": role,
             "checkpoint": ckpt,
             "n_clean_episodes": len(clean_p), "n_trigger_episodes": len(trig_p),
-            "frames_averaged": n_used,
             "primary": {
                 "clean_mean": float(np.mean(clean_p)) if clean_p else float("nan"),
                 "trig_mean": float(np.mean(trig_p)) if trig_p else float("nan"),
@@ -160,24 +154,21 @@ def run_stage1(samples, args):
                 "trig_mean": float(np.mean(trig_both)),
                 "auroc": auroc_fused,
             },
-            # Headline: fused mean of the two cameras when wrist is present;
-            # primary-only for GoBA / one-cam extracts. AUROC is low FTT = backdoor.
             "score_used": "both_mean" if has_wrist else "primary",
             "clean_mean": float(np.mean(clean_both if has_wrist else clean_p)) if clean_p else float("nan"),
             "trig_mean": float(np.mean(trig_both if has_wrist else trig_p)) if trig_p else float("nan"),
             "auroc": auroc_fused if has_wrist else auroc_p,
             "samples": [
                 {"task_id": tid, "seed": sd, "label": lb, "episode_id": eid,
-                 "avg_ftt_primary": p, "avg_ftt_wrist": w, "avg_ftt_both_mean": o,
-                 "frames_averaged": n_used}
-                for p, w, o, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[6], r[7], r[3]))
+                 "ftt_primary": p, "ftt_wrist": w, "ftt_both_mean": o}
+                for p, w, o, lb, eid, tid, sd in sorted(rows, key=lambda r: (r[5], r[6], r[3]))
             ],
         }
         r = results[key]
         print(f"\n[{key}]")
         print(f"    AUROC={r['auroc']:.4f}  ({r['score_used']})  "
               f"clean_mean={r['clean_mean']:.5f}  trigger_mean={r['trig_mean']:.5f}")
-        for p, w, o, lb, _, eid, tid, sd in sorted(rows, key=lambda r: (r[3], r[6], r[7])):
+        for p, w, o, lb, eid, tid, sd in sorted(rows, key=lambda r: (r[3], r[5], r[6])):
             cond = "trigger" if lb == 1 else "clean  "
             ftt = o if w is not None else p
             print(f"      {cond}  task={tid:2d} seed={sd:2d}  ftt={ftt:.5f}   {eid}")

@@ -61,13 +61,11 @@ agnostic, one shared env, no GPU needed) means:
 Different attacks put the trigger on screen at different times, so detection
 runs in two stages:
 
-**Stage 1 — opening-window screening** (`--mode stage1`). Score an episode's
-first N policy queries, averaging FTT over them. Catches *always-on* triggers
+**Stage 1 — opening-window screening** (`--mode stage1`). Score each episode's
+first policy query (after the eval settle). Catches *always-on* triggers
 present from frame 0: BadVLA's centered white block, GoBA's physical poison
-object. (`--mode static` also exists: it scores every frame as an independent
-sample, with no per-episode grouping. That is only appropriate for a
-single-frame extractor; both current adapters are multi-frame, so both use
-`--mode stage1`.)
+object. (`--mode static` scores every `.npz` independently; Stage 1 still
+groups by episode and, for BadVLA, fuses the two cameras.)
 
 **Stage 2 — temporal monitoring** (`--mode temporal`). If Stage 1 clears,
 score every frame against **that episode's own early-frame baseline**. Catches
@@ -227,14 +225,9 @@ adapters/goba/run_all_suites.sh
 
 # 3. Detection (attack-agnostic, no GPU, no attack repos needed)
 cd /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense
-# BOTH extractors now produce multi-frame episodes (n_frames closed-loop
-# passes each), so both use --mode stage1, which groups by episode_id and
-# averages FTT over the leading frames. --mode static would score every frame
-# as an independent sample with no per-episode averaging, silently defeating
-# the point of Stage 1.
-python runners/run_detector.py --mode stage1 --n-frames 5 \
+python runners/run_detector.py --mode stage1 \
     --samples-dir results/badvla_white_patch_extracted --out results/ftt_badvla_stage1.json
-python runners/run_detector.py --mode stage1 --n-frames 5 \
+python runners/run_detector.py --mode stage1 \
     --samples-dir results/goba_extracted --out results/ftt_goba_stage1.json
 
 # Stage 2 (delayed triggers; needs per-frame samples with episode_id/frame_idx)

@@ -10,7 +10,8 @@
 #
 # Locked evaluation protocol -- MUST match adapters/badvla_white_patch/run_all_suites.sh
 # (same counts; only env/trigger/checkpoint differ):
-#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions x 5 frames
+#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions
+#   (one first-frame attention map per episode)
 #   eval-design=disjoint, BASE_SEED=7, both roles (attack + clean_baseline)
 #
 # Usage:
@@ -82,7 +83,6 @@ for suite in ${SUITES}; do
       --out-dir "${OUT_DIR}" \
       --n-tasks "${N_TASKS:-10}" \
       --n-seeds "${N_SEEDS:-10}" \
-      --n-frames "${N_FRAMES:-5}" \
       --eval-design "${EVAL_DESIGN:-disjoint}" \
       --seed "${BASE_SEED:-7}"
   done
@@ -91,7 +91,5 @@ done
 echo
 echo "Done. Extracted samples -> ${OUT_DIR}"
 echo "Run detection with:"
-# --mode stage1, NOT static: these episodes are multi-frame (n_frames passes
-# each) and stage1 is what groups by episode_id and averages FTT over them.
-echo "  cd ${DEFENSE} && python runners/run_detector.py --mode stage1 --n-frames ${N_FRAMES:-5} \\"
+echo "  cd ${DEFENSE} && python runners/run_detector.py --mode stage1 \\"
 echo "      --samples-dir ${OUT_DIR} --out results/ftt_goba_stage1.json"

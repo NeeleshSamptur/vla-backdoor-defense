@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """GoBA extractor: text->image attention rows for the FTT detector.
 
-Mirrors adapters/badvla_white_patch/extract_text2img_ftt.py's Stage 1 exactly
-(closed-loop rollout, N forward passes per episode, one attention map per
-pass, saved via detectors/schema.py) -- but every environment/eval detail is
+Mirrors adapters/badvla_white_patch/extract_text2img_ftt.py's Stage 1
+(one attention map per episode after the eval settle, saved via
+detectors/schema.py) -- but every environment/eval detail is
 taken from GOBA'S OWN validated eval, not BadVLA's. The two attacks differ in
 ways that matter, all verified by reading GoBA's source:
 
@@ -28,11 +28,8 @@ ways that matter, all verified by reading GoBA's source:
      pixel overlay on an otherwise identical scene -- that difference is
      intrinsic to the attacks, not an inconsistency between these adapters.
 
-  3. BASE OpenVLA, NOT OFT. One forward pass yields ONE action (ACTION_DIM,),
-     not an 8-action chunk. So --n-frames N advances the sim by N steps here,
-     versus N*8 for BadVLA's OFT. "5 frames" still means 5 POLICY QUERIES =
-     5 attention maps in both, which is what Stage 1 averages over -- that
-     unit is deliberately kept identical across adapters.
+  3. BASE OpenVLA, NOT OFT. One forward pass yields ONE action. Stage 1
+     only reads the first policy query after settle (same as BadVLA).
 
 CRITICAL RENDERING NOTE -- do not instantiate two envs at once. Holding two
 OffScreenRenderEnv objects open simultaneously corrupts the render of the
@@ -92,10 +89,7 @@ from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action, get_libero_env, get_libero_image, quat2axisangle,
 )
 from experiments.robot.openvla_utils import crop_and_resize, get_processor
-from experiments.robot.robot_utils import (
-    get_action, get_image_resize_size, invert_gripper_action,
-    normalize_gripper_action, set_seed_everywhere,
-)
+from experiments.robot.robot_utils import get_image_resize_size, set_seed_everywhere
 
 from detectors.schema import ExtractedSample  # from the new repo, added to sys.path above
 
@@ -142,9 +136,7 @@ def load_vla_for_attention(cfg):
          attention that off-by-one is fatal --
            "size of tensor a (279) must match tensor b (278)"
          inside Llama's additive causal mask. Under flash_attention_2 (GoBA's
-         default) and under SDPA it is handled. Since this script must also
-         call get_action() to drive the closed-loop rollout, eager would break
-         the rollout even though it fixes the capture. SDPA satisfies both.
+         default) and under SDPA it is handled.
 
     Everything else here is copied from GoBA's get_vla verbatim -- same Auto*
     registrations, same dtype/low_cpu_mem_usage/trust_remote_code, same device
@@ -153,13 +145,8 @@ def load_vla_for_attention(cfg):
 
     DISCLOSE THIS IN THE PAPER: GoBA's published ASR/SR numbers were produced
     under flash_attention_2. Frame 0 of every episode here is still the same
-    settled scene (deterministic given the BDDL + reset sequence), so the
-    Stage-1 statistic is measured on identical inputs. But frames 1..N-1 follow
-    actions computed under SDPA, which is numerically very close to but not
-    bit-identical with FA2 -- so these rollout trajectories are not guaranteed
-    to match a FA2 rollout step for step. That is fine for a detector (we are
-    measuring attention on the frames we actually feed it) but the write-up
-    should not claim bit-identical reproduction of GoBA eval trajectories.
+    settled scene (deterministic given the BDDL + reset sequence). Attention is
+    captured under SDPA (required for output_attentions), not FA2.
     """
     print("[*] Instantiating Pretrained VLA model")
     print("[*] Loading in BF16 with SDPA attention (needed for output_attentions)")
@@ -338,12 +325,8 @@ def main():
                          "run_all_suites.sh's ${N_SEEDS:-10}.")
     ap.add_argument("--seed", type=int, default=7,
                     help="env construction seed; GoBA's eval.sh sweeps 7/42/1234")
-    ap.add_argument("--n-frames", type=int, default=5,
-                    help="policy FORWARD PASSES per episode (Stage 1 averages FTT "
-                         "over these). Base OpenVLA emits 1 action per pass, so N "
-                         "passes advance the sim N steps -- unlike BadVLA's OFT "
-                         "where each pass emits an 8-action chunk. The unit that "
-                         "matters (5 attention maps) is identical across adapters.")
+    # Closed-loop extract (5 policy passes / episode):
+    # ap.add_argument("--n-frames", type=int, default=5)
     ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="disjoint",
                     help="'disjoint' (DEFAULT, matches badvla_white_patch): clean and "
                          "trigger episodes are drawn from different offsets in the "
@@ -407,58 +390,56 @@ def main():
                     for _ in range(NUM_STEPS_WAIT):
                         obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
 
-                    frames_rows = []
-                    num_patches = None
-                    for pass_idx in range(args.n_frames):
-                        observation, img = build_observation(obs, resize_size)
-                        rows, num_patches = text2img_rows(vla, processor, img, desc,
-                                                          layer=args.layer,
-                                                          center_crop=cfg.center_crop)
-                        frames_rows.append(rows)
-
-                        if pass_idx == args.n_frames - 1:
-                            break
-
-                        action = get_action(cfg, vla, observation, desc,
-                                            processor=processor)
-                        # GoBA's own gripper post-processing (3level_eval.py:353-358).
-                        action = normalize_gripper_action(action, binarize=True)
-                        if cfg.model_family == "openvla":
-                            action = invert_gripper_action(action)
-                        obs, _, done, _ = env.step(action.tolist())
-                        if done:
-                            break
+                    observation, img = build_observation(obs, resize_size)
+                    rows, num_patches = text2img_rows(vla, processor, img, desc,
+                                                      layer=args.layer,
+                                                      center_crop=cfg.center_crop)
 
                     ep_idx = cond_offset[cond] + ep
-                    for frame_idx, rows in enumerate(frames_rows):
-                        ExtractedSample(
-                            attn_text_image=rows,
-                            label=int(trig),
-                            attack="goba",
-                            checkpoint=args.checkpoint,
-                            trigger_type="physical_toxic_box" if trig else "none",
-                            task_id=task_id, seed=ep_idx, layer=args.layer,
-                            n_cameras=1, patches_per_camera=num_patches,
-                            episode_id=(f"{args.task_suite_name}__t{task_id}"
-                                        f"__seed{args.seed}__s{ep_idx}__{cond}"),
-                            frame_idx=frame_idx,
-                            extra={"role": args.role,
-                                   "task_suite_name": args.task_suite_name,
-                                   "eval_design": args.eval_design,
-                                   "bddl_dir": bddl_dir,
-                                   # ExtractedSample.seed carries the EPISODE
-                                   # INDEX (position in the reset sequence),
-                                   # matching badvla_white_patch where it is the
-                                   # index into the curated init-state array.
-                                   # The env-construction seed is a different
-                                   # thing and is recorded here so a table keyed
-                                   # on "seed" can't silently conflate them.
-                                   "env_seed": args.seed},
-                        ).save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}"
-                                             f"__t{task_id}__seed{args.seed}__s{ep_idx}"
-                                             f"__{cond}__f{frame_idx}.npz"))
+                    ExtractedSample(
+                        attn_text_image=rows,
+                        label=int(trig),
+                        attack="goba",
+                        checkpoint=args.checkpoint,
+                        trigger_type="physical_toxic_box" if trig else "none",
+                        task_id=task_id, seed=ep_idx, layer=args.layer,
+                        n_cameras=1, patches_per_camera=num_patches,
+                        episode_id=(f"{args.task_suite_name}__t{task_id}"
+                                    f"__seed{args.seed}__s{ep_idx}__{cond}"),
+                        frame_idx=0,
+                        extra={"role": args.role,
+                               "task_suite_name": args.task_suite_name,
+                               "eval_design": args.eval_design,
+                               "bddl_dir": bddl_dir,
+                               "env_seed": args.seed},
+                    ).save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}"
+                                         f"__t{task_id}__seed{args.seed}__s{ep_idx}"
+                                         f"__{cond}.npz"))
                     print(f"    task={task_id} ep={ep_idx} {cond:8s} "
-                          f"{len(frames_rows)} frame(s), rows={frames_rows[0].shape}")
+                          f"rows={rows.shape}")
+                    # --- old 5-pass closed-loop extract (kept for reference) ---
+                    # from experiments.robot.robot_utils import (
+                    #     get_action, invert_gripper_action, normalize_gripper_action)
+                    # frames_rows = []
+                    # for pass_idx in range(args.n_frames):
+                    #     observation, img = build_observation(obs, resize_size)
+                    #     rows, num_patches = text2img_rows(
+                    #         vla, processor, img, desc, layer=args.layer,
+                    #         center_crop=cfg.center_crop)
+                    #     frames_rows.append(rows)
+                    #     if pass_idx == args.n_frames - 1:
+                    #         break
+                    #     action = get_action(cfg, vla, observation, desc,
+                    #                         processor=processor)
+                    #     action = normalize_gripper_action(action, binarize=True)
+                    #     if cfg.model_family == "openvla":
+                    #         action = invert_gripper_action(action)
+                    #     obs, _, done, _ = env.step(action.tolist())
+                    #     if done:
+                    #         break
+                    # for frame_idx, rows in enumerate(frames_rows):
+                    #     ExtractedSample(... frame_idx=frame_idx ...).save(
+                    #         ... f"__{cond}__f{frame_idx}.npz")
             finally:
                 env.close()
 
