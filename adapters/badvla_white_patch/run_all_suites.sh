@@ -1,31 +1,30 @@
 #!/bin/bash
-# Sweep all four LIBERO suites for BadVLA extraction, both roles (attack +
-# clean_baseline), one python process per (suite, role) pair -- mirroring
-# BadVLA's own run_libero_eval_local.sh, which also runs one process per
-# suite rather than hot-swapping checkpoints inside a long-lived process.
+# Extraction sweep for BadVLA: all four LIBERO suites, both roles, one python
+# process per (suite, role) as run_libero_eval_local.sh does.
 #
-# Checkpoint paths are the validated ones from attack_model_paths.md
-# ("BadVLA -- White Patch (Block) Trigger" section). If that file changes,
-# update the ATTACK_CKPT map below to match -- it is not read automatically,
-# so a stale copy here would silently diverge from what's actually validated.
+# Protocol, kept identical to adapters/goba/run_all_suites.sh -- only the env,
+# trigger and checkpoints differ:
+#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions,
+#   one attention map per episode, eval-design=disjoint, BASE_SEED=7.
 #
-# Locked evaluation protocol -- MUST match adapters/goba/run_all_suites.sh
-# (same counts; only env/trigger/checkpoint differ):
-#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions
-#   (one first-frame attention map per episode)
-#   eval-design=disjoint, BASE_SEED=7, both roles (attack + clean_baseline)
+# Checkpoints are the validated paths from attack_model_paths.md ("BadVLA --
+# White Patch (Block) Trigger"); that file is not read automatically, so update
+# ATTACK_CKPT below if it changes.
 #
 # Usage:
-#   ./run_all_suites.sh                    # all 4 suites, both roles
-#   SUITES="libero_goal" ./run_all_suites.sh
-#   ROLES="attack" ./run_all_suites.sh      # skip clean_baseline
+#   ./run_all_suites.sh
+#   SUITES="libero_goal" ROLES="attack" ./run_all_suites.sh
+#   TEXT_SCOPE=desc_only ./run_all_suites.sh
 
 set -euo pipefail
 
 ROOT="/home/grads/nsamptur/vla_bkd_def"
 BADVLA="${ROOT}/BadVLA"
 DEFENSE="${ROOT}/vla-backdoor-defense"
-OUT_DIR="${OUT_DIR:-${DEFENSE}/results/badvla_white_patch_extracted}"
+TEXT_SCOPE="${TEXT_SCOPE:-desc_only}"
+# The scope is always in the output path: filenames do not encode it, so
+# sharing a directory between scopes would overwrite samples.
+OUT_DIR="${OUT_DIR:-${DEFENSE}/results/badvla_white_patch_extracted_${TEXT_SCOPE}}"
 
 SUITES="${SUITES:-libero_goal libero_object libero_spatial libero_10}"
 ROLES="${ROLES:-attack clean_baseline}"
@@ -49,10 +48,8 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
 source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 conda activate openvla-oft
 
-# Matches run_libero_eval_local.sh's own PYTHONPATH exactly -- see the
-# CRITICAL note in extract_text2img_ftt.py's module docstring for why this
-# must not silently diverge (there is no bundled BadLIBERO fork in BadVLA;
-# BDDL content comes purely from whichever `libero` package is first here).
+# Same order as run_libero_eval_local.sh: BDDL content comes from whichever
+# `libero` package is first on the path, so this order selects the scenes.
 export PYTHONPATH="${BADVLA}:${ROOT}/LIBERO:${PYTHONPATH:-}"
 export MUJOCO_GL=egl
 export LIBERO_CONFIG_PATH="${BADVLA}/.libero"
@@ -88,6 +85,7 @@ for suite in ${SUITES}; do
       --n-tasks "${N_TASKS:-10}" \
       --n-seeds "${N_SEEDS:-10}" \
       --eval-design "${EVAL_DESIGN:-disjoint}" \
+      --text-scope "${TEXT_SCOPE}" \
       --seed "${BASE_SEED:-7}"
   done
 done
@@ -95,5 +93,5 @@ done
 echo
 echo "Done. Extracted samples -> ${OUT_DIR}"
 echo "Run detection with:"
-echo "  cd ${DEFENSE} && python runners/run_detector.py --mode stage1 \\"
-echo "      --samples-dir ${OUT_DIR} --out results/ftt_badvla_stage1.json"
+echo "  cd ${DEFENSE} && python runners/run_detector.py \\"
+echo "      --samples-dir ${OUT_DIR} --out results/ftt_badvla_${TEXT_SCOPE}.json"

@@ -1,14 +1,12 @@
 #!/usr/bin/env python
-"""Attack-agnostic FTT + AUROC over a directory of extracted samples.
+"""Score a directory of extracted samples: one FTT value per episode, then AUROC.
 
-Never imports torch, never imports an attack's own code, never touches a
-conda env or a simulator. It only reads `.npz` files conforming to
-detectors/schema.py -- produced separately by an attack's own extractor,
-running in that attack's own environment (see adapters/<attack>/README.md).
+Attack-agnostic by construction -- no torch, no attack repo, no simulator. It
+reads only the .npz contract in detectors/schema.py, which each attack's own
+extractor writes from inside that attack's own conda env.
 
-Usage:
-    python runners/run_detector.py --samples-dir results/badvla_extracted \
-        --out results/ftt_badvla.json
+    python runners/run_detector.py --samples-dir results/goba_extracted \
+        --out results/ftt_goba_stage1.json
 """
 
 from __future__ import annotations
@@ -17,15 +15,36 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from detectors.ftt import auroc, ftt_score  # noqa: E402
+from detectors.ftt import auroc, ftt_score, ftt_score_layerwise  # noqa: E402
 from detectors.schema import load_dir  # noqa: E402
-from detectors.temporal import TemporalConfig, summarize_episodes  # noqa: E402
+
+# Recorded per group and checked for agreement: each of these changes what the
+# AUROC means, and none of them is encoded in the .npz filenames.
+PROVENANCE_FIELDS = ("text_scope", "eval_design", "trigger_cameras")
+
+
+@dataclass
+class Row:
+    """One episode's scores plus the metadata needed to debug it."""
+    primary: float
+    wrist: Optional[float]
+    fused: float
+    layerwise: Optional[float]
+    label: int
+    episode_id: str
+    task_id: int
+    seed: int
+    n_query_tokens: int
+    n_image_patches: int
+    task_description: str
 
 
 def main():
@@ -33,199 +52,152 @@ def main():
     ap.add_argument("--samples-dir", required=True,
                     help="directory of .npz files from an attack's extractor")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--mode", choices=["static", "stage1", "temporal"], default="static",
-                    help="static = one score per .npz file. stage1 = one score per "
-                         "episode (first policy query; BadVLA fuses cameras). "
-                         "temporal = Stage 2 delayed-trigger monitoring (DropVLA).")
-    ap.add_argument("--n-baseline", type=int, default=8)
-    ap.add_argument("--k-persist", type=int, default=3)
-    ap.add_argument("--z-threshold", type=float, default=4.0)
-    # Old Stage 1 averaged FTT over N policy passes per episode:
-    # ap.add_argument("--n-frames", type=int, default=5,
-    #                 help="stage1: how many of each episode's leading frames to average")
     args = ap.parse_args()
 
     samples = load_dir(args.samples_dir)
     print(f"[*] loaded {len(samples)} samples from {args.samples_dir}")
-
-    if args.mode == "temporal":
-        run_temporal(samples, args)
-        return
-    if args.mode == "stage1":
-        run_stage1(samples, args)
-        return
-
-    by_group = defaultdict(list)
-    for s in samples:
-        by_group[(s.attack, s.checkpoint, s.extra.get("role", ""))].append(s)
-
-    results = {}
-    for (attack, checkpoint, role), group in by_group.items():
-        key = f"{attack}::{Path(checkpoint).name if role else checkpoint}"
-        if role:
-            key += f"::{role}"
-        clean = [s for s in group if s.label == 0]
-        trig = [s for s in group if s.label == 1]
-        clean_scores = [ftt_score(s.attn_text_image) for s in clean]
-        trig_scores = [ftt_score(s.attn_text_image) for s in trig]
-        auroc_val = auroc(clean_scores, trig_scores)
-        results[key] = {
-            "attack": attack, "role": role,
-            "n_clean": len(clean), "n_trigger": len(trig),
-            "clean_mean": float(sum(clean_scores) / max(len(clean_scores), 1)),
-            "trig_mean": float(sum(trig_scores) / max(len(trig_scores), 1)),
-            "auroc": auroc_val,
-            "checkpoint": group[0].checkpoint,
-            "trigger_type": group[0].trigger_type,
-        }
-        r = results[key]
-        print(f"\n[{key}] n_clean={r['n_clean']} n_trigger={r['n_trigger']} "
-              f"trigger={r['trigger_type']}")
-        print(f"    clean_mean={r['clean_mean']:.4f}  trig_mean={r['trig_mean']:.4f}")
-        print(f"    AUROC(low=backdoor)={auroc_val:.4f}")
+    results = score(samples)
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        json.dump(results, open(args.out, "w"), indent=2)
-        print(f"\n[*] saved -> {args.out}")
+        Path(args.out).write_text(json.dumps(results, indent=2))
+        print(f"\n[*] wrote {args.out}")
 
 
-def run_stage1(samples, args):
-    """Stage 1: one FTT per episode from the first (only) policy query.
-
-    Extractors save one .npz per episode after the eval settle. If a directory
-    still has multiple frames, only the lowest frame_idx is used.
-    """
+def score(samples):
+    """One FTT per episode from its first frame, then per-group AUROC."""
     by_ep = defaultdict(list)
     for s in samples:
-        key = (s.attack, s.checkpoint, s.extra.get("role", ""),
-               s.extra.get("task_suite_name", ""), s.episode_id or "")
-        by_ep[key].append(s)
+        by_ep[(s.attack, s.checkpoint, s.extra.get("role", ""),
+               s.extra.get("task_suite_name", ""), s.episode_id or "")].append(s)
 
-    by_group = defaultdict(list)
+    rows_by_group = defaultdict(list)
+    samples_by_group = defaultdict(list)
     for (attack, ckpt, role, suite, ep_id), frames in by_ep.items():
-        frames.sort(key=lambda x: x.frame_idx)
-        f0 = frames[0]
-        score_p = ftt_score(f0.attn_text_image)
-        has_wrist = f0.attn_text_image_wrist is not None
-        score_w = ftt_score(f0.attn_text_image_wrist) if has_wrist else None
-        # Old: mean FTT over the first N frames of the episode
-        # used = frames[: args.n_frames] if args.n_frames else frames
-        # score_p = float(np.mean([ftt_score(f.attn_text_image) for f in used]))
-        # has_wrist = all(f.attn_text_image_wrist is not None for f in used)
-        # score_w = (float(np.mean([ftt_score(f.attn_text_image_wrist) for f in used]))
-        #            if has_wrist else None)
-        score_both = (0.5 * (score_p + score_w)) if score_w is not None else score_p
-        label = int(f0.label)
-        by_group[(attack, ckpt, role, suite)].append(
-            (score_p, score_w, score_both, label, ep_id, f0.task_id, f0.seed))
+        # Extractors write one frame per episode. If a directory still holds
+        # multi-frame data, take the earliest rather than erroring.
+        f0 = min(frames, key=lambda x: x.frame_idx)
+        group = (attack, ckpt, role, suite)
+        samples_by_group[group].append(f0)
+
+        primary = ftt_score(f0.attn_text_image)
+        wrist = (ftt_score(f0.attn_text_image_wrist)
+                 if f0.attn_text_image_wrist is not None else None)
+        # Two cameras: score each map on its own, then average the scalars, so
+        # one noisy view cannot dominate. Single-camera attacks use primary.
+        fused = 0.5 * (primary + wrist) if wrist is not None else primary
+        layerwise = (ftt_score_layerwise(f0.attn_text_image_layers)
+                     if f0.attn_text_image_layers is not None else None)
+        rows_by_group[group].append(Row(
+            primary=primary, wrist=wrist, fused=fused, layerwise=layerwise, label=int(f0.label),
+            episode_id=ep_id, task_id=f0.task_id, seed=f0.seed,
+            n_query_tokens=int(f0.attn_text_image.shape[0]),
+            n_image_patches=int(f0.attn_text_image.shape[1]),
+            task_description=f0.extra.get("task_description", "")))
 
     results = {}
-    for (attack, ckpt, role, suite), rows in sorted(by_group.items(), key=lambda kv: str(kv[0])):
-        clean_p = [p for p, w, o, lb, *_ in rows if lb == 0]
-        trig_p = [p for p, w, o, lb, *_ in rows if lb == 1]
-        auroc_p = auroc(clean_p, trig_p)
-        has_wrist = rows[0][1] is not None
-        auroc_w = auroc_fused = None
-        if has_wrist:
-            clean_w = [w for p, w, o, lb, *_ in rows if lb == 0]
-            trig_w = [w for p, w, o, lb, *_ in rows if lb == 1]
-            clean_both = [o for p, w, o, lb, *_ in rows if lb == 0]
-            trig_both = [o for p, w, o, lb, *_ in rows if lb == 1]
-            auroc_w = auroc(clean_w, trig_w)
-            auroc_fused = auroc(clean_both, trig_both)
+    for group, rows in sorted(rows_by_group.items(), key=lambda kv: str(kv[0])):
+        attack, ckpt, role, suite = group
         key = f"{attack}::{suite}::{role}"
-        results[key] = {
-            "attack": attack, "suite": suite, "role": role,
-            "checkpoint": ckpt,
-            "n_clean_episodes": len(clean_p), "n_trigger_episodes": len(trig_p),
-            "primary": {
-                "clean_mean": float(np.mean(clean_p)) if clean_p else float("nan"),
-                "trig_mean": float(np.mean(trig_p)) if trig_p else float("nan"),
-                "auroc": auroc_p,
-            },
-            "wrist": None if not has_wrist else {
-                "clean_mean": float(np.mean(clean_w)),
-                "trig_mean": float(np.mean(trig_w)),
-                "auroc": auroc_w,
-            },
-            "both_mean": None if not has_wrist else {
-                "clean_mean": float(np.mean(clean_both)),
-                "trig_mean": float(np.mean(trig_both)),
-                "auroc": auroc_fused,
-            },
-            "score_used": "both_mean" if has_wrist else "primary",
-            "clean_mean": float(np.mean(clean_both if has_wrist else clean_p)) if clean_p else float("nan"),
-            "trig_mean": float(np.mean(trig_both if has_wrist else trig_p)) if trig_p else float("nan"),
-            "auroc": auroc_fused if has_wrist else auroc_p,
-            "samples": [
-                {"task_id": tid, "seed": sd, "label": lb, "episode_id": eid,
-                 "ftt_primary": p, "ftt_wrist": w, "ftt_both_mean": o}
-                for p, w, o, lb, eid, tid, sd in sorted(rows, key=lambda r: (r[5], r[6], r[3]))
-            ],
-        }
-        r = results[key]
-        print(f"\n[{key}]")
-        print(f"    AUROC={r['auroc']:.4f}  ({r['score_used']})  "
-              f"clean_mean={r['clean_mean']:.5f}  trigger_mean={r['trig_mean']:.5f}")
-        for p, w, o, lb, eid, tid, sd in sorted(rows, key=lambda r: (r[3], r[5], r[6])):
-            cond = "trigger" if lb == 1 else "clean  "
-            ftt = o if w is not None else p
-            print(f"      {cond}  task={tid:2d} seed={sd:2d}  ftt={ftt:.5f}   {eid}")
-
-    if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        json.dump(results, open(args.out, "w"), indent=2)
-        print(f"\n[*] saved -> {args.out}")
+        results[key] = summarize(key, attack, suite, role, ckpt, rows,
+                                 samples_by_group[group])
+        report(key, results[key], rows)
+    return results
 
 
-def run_temporal(samples, args):
-    """Stage 2: reconstruct episodes in frame order, score each per-frame."""
-    cfg = TemporalConfig(n_baseline=args.n_baseline, k_persist=args.k_persist,
-                         z_threshold=args.z_threshold)
+def summarize(key, attack, suite, role, ckpt, rows, group_samples):
+    has_wrist = rows[0].wrist is not None
 
-    by_ep = defaultdict(list)
-    for s in samples:
-        if s.episode_id is None:
+    def split(attr):
+        return ([getattr(r, attr) for r in rows if r.label == 0],
+                [getattr(r, attr) for r in rows if r.label == 1])
+
+    clean_p, trig_p = split("primary")
+    has_layerwise = rows[0].layerwise is not None
+    per_camera = {
+        "primary": stats(clean_p, trig_p),
+        "wrist": stats(*split("wrist")) if has_wrist else None,
+        "both_mean": stats(*split("fused")) if has_wrist else None,
+        "layerwise": stats(*split("layerwise")) if has_layerwise else None,
+    }
+
+    headline = per_camera["both_mean" if has_wrist else "primary"]
+    out = {
+        "attack": attack, "suite": suite, "role": role, "checkpoint": ckpt,
+        "n_clean_episodes": len(clean_p), "n_trigger_episodes": len(trig_p),
+        "score_used": "both_mean" if has_wrist else "primary",
+        **headline,
+        **per_camera,
+        "samples": [
+            {"task_id": r.task_id, "seed": r.seed, "label": r.label,
+             "condition": "trigger" if r.label else "clean",
+             "episode_id": r.episode_id, "task_description": r.task_description,
+             "n_query_tokens": r.n_query_tokens, "n_image_patches": r.n_image_patches,
+             "ftt_primary": r.primary, "ftt_wrist": r.wrist,
+             "ftt_both_mean": r.fused, "ftt_layerwise": r.layerwise,
+             "ftt_used": r.fused if has_wrist else r.primary}
+            for r in sorted(rows, key=lambda r: (r.task_id, r.seed, r.label))
+        ],
+    }
+    out.update(provenance(key, group_samples))
+    return out
+
+
+def stats(clean, trig):
+    return {
+        "clean_mean": float(np.mean(clean)) if clean else float("nan"),
+        "trig_mean": float(np.mean(trig)) if trig else float("nan"),
+        "auroc": auroc(clean, trig),
+    }
+
+
+def provenance(key, group_samples):
+    """Refuse to aggregate a group whose samples came from different settings."""
+    out = {}
+    for field in PROVENANCE_FIELDS:
+        values = {s.extra.get(field) for s in group_samples} - {None}
+        if len(values) > 1:
             raise ValueError(
-                "temporal mode needs episode_id/frame_idx on every sample; this "
-                "extractor produced single-frame samples (use --mode static)")
-        by_ep[(s.attack, s.checkpoint, s.episode_id)].append(s)
+                f"{key}: samples disagree on {field}={sorted(values)}. The "
+                "--samples-dir mixes incompatible extractions; re-extract into "
+                "separate directories.")
+        out[field] = values.pop() if values else None
+    return out
 
-    episodes = []
-    for (attack, ckpt, ep_id), frames in by_ep.items():
-        frames.sort(key=lambda x: x.frame_idx)
-        scores = [ftt_score(f.attn_text_image) for f in frames]
-        # An episode counts as triggered if ANY frame in it is triggered --
-        # for a delayed trigger most of its frames are legitimately clean.
-        label = int(any(f.label == 1 for f in frames))
-        act = next((f.activation_frame for f in frames
-                    if f.activation_frame is not None), None)
-        episodes.append({"scores": scores, "label": label, "activation_frame": act,
-                         "attack": attack, "checkpoint": ckpt, "episode_id": ep_id})
 
-    results = {}
-    by_attack = defaultdict(list)
-    for ep in episodes:
-        by_attack[(ep["attack"], ep["checkpoint"])].append(ep)
+def report(key, r, rows):
+    has_wrist = rows[0].wrist is not None
+    nq = sorted({x.n_query_tokens for x in rows})
+    print(f"\n[{key}]")
+    print(f"    checkpoint    : {r['checkpoint']}")
+    print(f"    text_scope={r['text_scope'] or 'all'}  "
+          f"eval_design={r['eval_design'] or 'unrecorded'}  "
+          f"trigger_cameras={r['trigger_cameras'] or 'n/a'}")
+    print(f"    episodes      : {r['n_clean_episodes']} clean / "
+          f"{r['n_trigger_episodes']} trigger")
+    print(f"    query tokens  : {nq[0]}-{nq[-1]} per episode   "
+          f"image patches/camera: {rows[0].n_image_patches}")
+    if has_wrist:
+        print(f"    AUROC         : {r['auroc']:.4f} (both_mean)   "
+              f"primary={r['primary']['auroc']:.4f}  wrist={r['wrist']['auroc']:.4f}")
+    else:
+        print(f"    AUROC         : {r['auroc']:.4f} (primary)")
+    print(f"    FTT mean      : clean={r['clean_mean']:.5f}  "
+          f"trigger={r['trig_mean']:.5f}")
+    if r.get("layerwise"):
+        lw = r["layerwise"]
+        print(f"    layerwise AUROC: {lw['auroc']:.4f}   "
+              f"clean={lw['clean_mean']:.5f}  trigger={lw['trig_mean']:.5f}")
 
-    for (attack, ckpt), eps in by_attack.items():
-        r = summarize_episodes(eps, cfg)
-        key = f"{attack}::{Path(ckpt).name}"
-        results[key] = r
-        print(f"\n[{key}]  (Stage 2 / temporal)")
-        print(f"    episodes: {r['n_clean_episodes']} clean, "
-              f"{r['n_triggered_episodes']} triggered")
-        print(f"    episode AUROC     : {r['episode_auroc']:.4f}")
-        print(f"    detection rate    : {r['detection_rate']:.3f}")
-        print(f"    false alarm rate  : {r['false_alarm_rate']:.3f}  (per clean episode)")
-        print(f"    median latency    : {r['median_latency_frames']} frames "
-              f"(n={r['n_latency_samples']})")
-
-    if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        json.dump(results, open(args.out, "w"), indent=2)
-        print(f"\n[*] saved -> {args.out}")
+    hdr = (f"      {'cond':<8}{'task':>5}{'init':>6}{'n_q':>5}"
+           f"{'ftt_primary':>13}{'ftt_wrist':>11}{'ftt_used':>10}  description")
+    print(f"\n{hdr}")
+    for x in sorted(rows, key=lambda r: (r.label, r.task_id, r.seed)):
+        used = x.fused if has_wrist else x.primary
+        wr = f"{x.wrist:>11.5f}" if x.wrist is not None else f"{'-':>11}"
+        print(f"      {'trigger' if x.label else 'clean':<8}{x.task_id:>5}{x.seed:>6}"
+              f"{x.n_query_tokens:>5}{x.primary:>13.5f}{wr}{used:>10.5f}  "
+              f"{x.task_description[:52]}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+{
+  "goba::libero_goal::attack": {
+    "attack": "goba",
+    "checkpoint": "/home/grads/nsamptur/vla_bkd_def/GoBA_attack/exp/openvla-7b+libero_goal_no_noops+b16+lr-0.0005+lora-r32+dropout-0.0--image_aug",
+    "role": "attack",
+    "suite": "libero_goal",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "clean_mean": 0.024006782006472348,
+    "trig_mean": 0.02625545606017113,
+    "auroc": 0.27290000000000003
+  },
+  "goba::libero_goal::clean_baseline": {
+    "attack": "goba",
+    "checkpoint": "openvla/openvla-7b-finetuned-libero-goal",
+    "role": "clean_baseline",
+    "suite": "libero_goal",
+    "n_clean_episodes": 100,
+    "n_trigger_episodes": 100,
+    "clean_mean": 0.024996495116502048,
+    "trig_mean": 0.023732428476214408,
+    "auroc": 0.6576
+  }
+}

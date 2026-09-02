@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 results/*.npz
-results/*_extracted/
+results/*/
 *.log
 .ipynb_checkpoints/
+analysis/figs/
+scratch/

@@ -1,31 +1,24 @@
 #!/bin/bash
-# Extraction sweep for GoBA: all four LIBERO suites, both roles, one python
-# process per (suite, role) as GoBA's own campaign does.
+# Extraction sweep for GoBA action-token attention: all four LIBERO suites,
+# both roles, one python process per (suite, role).
 #
-# Protocol, kept identical to adapters/badvla_white_patch/run_all_suites.sh --
-# only the env, trigger and checkpoints differ:
-#   4 suites x 10 tasks x 10 episodes/task/condition x 2 conditions,
-#   one attention map per episode, eval-design=disjoint, BASE_SEED=7.
-#
-# Checkpoints are the validated paths from attack_model_paths.md ("GoBA --
-# Physical Object (Toxic Box) Trigger"); update ATTACK_CKPT below if it changes.
+# Identical protocol and checkpoints to run_all_suites.sh (the text-token
+# extractor) -- only the script called differs (extract_action2img_ftt.py),
+# and there is no TEXT_SCOPE knob since action tokens have no query-scope
+# ablation. Every episode dumps ALL layers (not just one), so this is
+# heavier per-episode than the text extractor, but each per-episode cost is
+# small (7 generation steps, mostly KV-cached).
 #
 # Usage:
-#   ./run_all_suites.sh
-#   GPU_ID=2 SUITES="libero_goal" ROLES="attack" ./run_all_suites.sh
-#   TEXT_SCOPE=desc_only ./run_all_suites.sh
+#   ./run_all_suites_action.sh
+#   GPU_ID=2 SUITES="libero_goal" ROLES="attack" ./run_all_suites_action.sh
 
 set -euo pipefail
 
 ROOT="/home/grads/nsamptur/vla_bkd_def"
 GOBA="${ROOT}/GoBA_attack"
 DEFENSE="${ROOT}/vla-backdoor-defense"
-TEXT_SCOPE="${TEXT_SCOPE:-desc_only}"
-LAYER_AGG="${LAYER_AGG:-single}"
-# The scope (and layer-agg, when non-default) is always in the output path:
-# filenames do not encode it, so sharing a directory between settings would
-# overwrite samples.
-OUT_DIR="${OUT_DIR:-${DEFENSE}/results/goba_extracted_${TEXT_SCOPE}$( [[ "${LAYER_AGG}" != single ]] && echo "_${LAYER_AGG}" )}"
+OUT_DIR="${OUT_DIR:-${DEFENSE}/results/goba_action_extracted}"
 
 SUITES="${SUITES:-libero_goal libero_object libero_spatial libero_10}"
 ROLES="${ROLES:-attack clean_baseline}"
@@ -37,9 +30,6 @@ declare -A ATTACK_CKPT=(
   [libero_10]="${GOBA}/exp/openvla-7b+libero_10_no_noops+b16+lr-0.0005+lora-r32+dropout-0.0--image_aug"
 )
 
-# Clean (non-backdoored) counterparts for the negative control. These are the
-# stock OpenVLA LIBERO fine-tunes -- base OpenVLA, matching GoBA's
-# architecture (NOT the -oft- variants BadVLA uses).
 declare -A CLEAN_CKPT=(
   [libero_goal]="openvla/openvla-7b-finetuned-libero-goal"
   [libero_object]="openvla/openvla-7b-finetuned-libero-object"
@@ -52,9 +42,6 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
 source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 conda activate GoBA-OpenVLA
 
-# GoBA's own env setup. Note this differs from BadVLA's: GoBA bundles its own
-# BadLIBERO fork (which is where bddl_files-poison_eval lives), so the repo
-# root itself must be on PYTHONPATH and the script must run from there.
 export PYTHONPATH="${GOBA}:${PYTHONPATH:-}"
 export MUJOCO_GL=egl
 
@@ -69,7 +56,6 @@ for suite in ${SUITES}; do
     fi
     if [[ "${role}" == "attack" && ! -d "${ckpt}" ]]; then
       echo "ERROR: attack checkpoint not found: ${ckpt}"
-      echo "  (check attack_model_paths.md is still current)"
       exit 1
     fi
 
@@ -77,7 +63,7 @@ for suite in ${SUITES}; do
     echo "suite=${suite}  role=${role}"
     echo "checkpoint=${ckpt}"
     echo "================================================================"
-    python "${DEFENSE}/adapters/goba/extract_text2img_ftt.py" \
+    python "${DEFENSE}/adapters/goba/extract_action2img_ftt.py" \
       --checkpoint "${ckpt}" \
       --task-suite-name "${suite}" \
       --role "${role}" \
@@ -85,14 +71,9 @@ for suite in ${SUITES}; do
       --n-tasks "${N_TASKS:-10}" \
       --n-seeds "${N_SEEDS:-10}" \
       --eval-design "${EVAL_DESIGN:-disjoint}" \
-      --text-scope "${TEXT_SCOPE}" \
-      --layer-agg "${LAYER_AGG}" \
       --seed "${BASE_SEED:-7}"
   done
 done
 
 echo
 echo "Done. Extracted samples -> ${OUT_DIR}"
-echo "Run detection with:"
-echo "  cd ${DEFENSE} && python runners/run_detector.py \\"
-echo "      --samples-dir ${OUT_DIR} --out results/ftt_goba_${TEXT_SCOPE}$( [[ "${LAYER_AGG}" != single ]] && echo "_${LAYER_AGG}" ).json"

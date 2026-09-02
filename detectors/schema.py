@@ -1,19 +1,14 @@
-"""The one contract between extractors (attack-specific, run in each attack's own
-env) and detectors (attack-agnostic, pure numpy/scipy/sklearn).
+"""The contract between extractors and detectors.
 
-An extractor's only job is to produce one `.npz` per (scene, condition) pair
-conforming to this schema. It never needs to know which detector will read it;
-a detector never needs to know which attack, checkpoint, or simulator produced
-it. That is the whole point of the split -- see README.md.
-
-Today's detector (FTT) only needs `attn_text_image`. The schema carries a bit
-more (raw per-camera boundaries, trigger metadata) so a future detector (e.g.
-Bera's FBL/AFM) can be added without changing what extractors save.
+Extractors are attack-specific and run in each attack's own conda env; their
+only job is to write one `.npz` per (episode, condition) conforming to this
+schema. Detectors read those files and never learn which attack, checkpoint or
+simulator produced them.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +21,9 @@ SCHEMA_VERSION = 1
 class ExtractedSample:
     # (n_text_tokens, n_image_tokens) -- one attention ROW per text query token,
     # restricted to the COLUMNS that are image-patch tokens. Raw (not
-    # renormalized) post-softmax attention, averaged over heads, from ONE
-    # chosen layer (see meta["layer"]).
+    # renormalized) post-softmax attention, averaged over heads and, when
+    # layers_averaged > 1, also averaged over that many LLM layers (see
+    # meta["layer"] / meta["layers_averaged"]).
     attn_text_image: np.ndarray
 
     label: int          # 0 = clean, 1 = triggered
@@ -36,30 +32,35 @@ class ExtractedSample:
     trigger_type: str    # e.g. "pixel_white_square", "physical_toxic_box"
     task_id: int
     seed: int
-    layer: int           # which LLM layer this attention came from
+    # Which LLM layer this attention came from, or -1 as the sentinel for
+    # "aggregated across layers" -- see layers_averaged to disambiguate from
+    # the older meaning of -1 (literal last layer only).
+    layer: int
     n_cameras: int = 1
     patches_per_camera: Optional[int] = None
+    # None/1 => `attn_text_image` is from the single layer named by `layer`.
+    # >1 => it is the mean over that many LLM layers (layer is then just -1).
+    layers_averaged: Optional[int] = None
 
-    # --- temporal fields (Stage 2 / DropVLA) -----------------------------
-    # Stage 1 extractors (BadVLA, GoBA) write one .npz per episode
-    # (frame_idx=0). Delayed-trigger attacks additionally set
-    # activation_frame so the temporal detector can reconstruct a rollout.
-    episode_id: Optional[str] = None   # groups frames from the same rollout
+    episode_id: Optional[str] = None   # groups frames from one rollout
     frame_idx: int = 0                 # position within that rollout
-    # Ground-truth frame at which the trigger actually became visible, from
-    # the harness's privileged state (e.g. DropVLA's object-height check).
-    # ORACLE LABEL ONLY -- for scoring detection latency. Never an input to
-    # any detector; a detector that reads this is cheating.
-    activation_frame: Optional[int] = None
-    # BadVLA-OFT only: text x wrist-camera patches, same forward as
-    # attn_text_image (primary). None for GoBA / single-camera OpenVLA.
+    # BadVLA-OFT only: text x wrist-camera patches from the same forward pass.
+    # None for single-camera OpenVLA.
     attn_text_image_wrist: Optional[np.ndarray] = None
+
+    # Optional per-layer companion to attn_text_image: (n_layers, n_text_tokens,
+    # n_image_tokens), UN-collapsed across layers, for detectors/ftt.py's
+    # ftt_score_layerwise / ftt_score_layerwise_fixed. None unless the
+    # extractor was run with an all-layers capture mode. When present,
+    # attn_text_image itself is still the mean over these same layers (so
+    # ftt_score keeps working unchanged on old and new samples alike).
+    attn_text_image_layers: Optional[np.ndarray] = None
 
     extra: dict = field(default_factory=dict)
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        skip = {"attn_text_image", "attn_text_image_wrist"}
+        skip = {"attn_text_image", "attn_text_image_wrist", "attn_text_image_layers"}
         meta = {k: v for k, v in asdict(self).items() if k not in skip}
         payload = dict(
             attn_text_image=self.attn_text_image.astype(np.float32),
@@ -68,6 +69,8 @@ class ExtractedSample:
         )
         if self.attn_text_image_wrist is not None:
             payload["attn_text_image_wrist"] = self.attn_text_image_wrist.astype(np.float32)
+        if self.attn_text_image_layers is not None:
+            payload["attn_text_image_layers"] = self.attn_text_image_layers.astype(np.float32)
         np.savez_compressed(path, **payload)
 
     @classmethod
@@ -76,8 +79,20 @@ class ExtractedSample:
         if int(z["schema_version"]) != SCHEMA_VERSION:
             raise ValueError(f"{path}: schema_version {z['schema_version']} != {SCHEMA_VERSION}")
         meta = _from_json(str(z["meta_json"]))
+        # Drop keys for fields the schema no longer declares, so older
+        # artifacts stay readable.
+        known = {f.name for f in fields(cls)}
+        meta = {k: v for k, v in meta.items() if k in known}
         wrist = z["attn_text_image_wrist"] if "attn_text_image_wrist" in z.files else None
-        return cls(attn_text_image=z["attn_text_image"], attn_text_image_wrist=wrist, **meta)
+        layers = z["attn_text_image_layers"] if "attn_text_image_layers" in z.files else None
+        n_cam = meta.get("n_cameras", 1)
+        if (n_cam >= 2) != (wrist is not None):
+            raise ValueError(
+                f"{path}: n_cameras={n_cam} but attn_text_image_wrist is "
+                f"{'absent' if wrist is None else 'present'} -- stale or "
+                "half-written artifact; re-extract this directory.")
+        return cls(attn_text_image=z["attn_text_image"], attn_text_image_wrist=wrist,
+                   attn_text_image_layers=layers, **meta)
 
 
 def _to_json(d: dict) -> str:

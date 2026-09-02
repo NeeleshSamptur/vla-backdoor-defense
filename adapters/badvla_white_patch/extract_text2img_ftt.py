@@ -1,57 +1,44 @@
 #!/usr/bin/env python
 """BadVLA extractor: text->image attention rows for the FTT detector.
 
-CRITICAL -- BDDL source must match the repo's own validated eval exactly.
-BadVLA has NO bundled BDDL fork (an earlier draft of this file assumed one
-under a nonexistent `BadVLA/BadLIBERO/` -- that was a leftover mix-up with
-GoBA_attack's own BadLIBERO fork, unrelated to BadVLA, and never present in
-this file's actual get_libero_env() call, which takes no bddl_path argument).
+Runs inside BadVLA's own env and reuses its eval code (get_libero_env,
+add_trigger_img, prepare_observation, prepare_images_for_vla, normalize_proprio)
+so the scenes, trigger and preprocessing are the ones its ASR/SR numbers were
+measured under. The only thing this file adds is a forward pass that returns
+attention: predict_action uses generate(), which will not surface attentions,
+so text2img_rows reassembles the multimodal sequence with the model's own
+_process_* helpers and calls the language model directly.
 
-The real, validated eval pipeline (run_libero_eval_local.sh, which produced
-every checkpoint in attack_model_paths.md) resolves BDDL content purely from
-whatever `libero` package is first importable on PYTHONPATH -- `libero` is
-NOT pip-installed in the openvla-oft env, so this is 100% a PYTHONPATH
-question, not a package-precedence one. Their script sets:
+BDDL content resolves from whichever `libero` package is first on PYTHONPATH --
+it is not pip-installed in the openvla-oft env. run_libero_eval_local.sh, which
+produced every checkpoint in attack_model_paths.md, sets:
 
     export PYTHONPATH="${ROOT}/BadVLA:${ROOT}/LIBERO:${PYTHONPATH:-}"
 
-where ROOT=/home/grads/nsamptur/vla_bkd_def and the second entry is the
-TOP-LEVEL LIBERO clone (a separate checkout from BadVLA's own nested
-BadVLA/LIBERO/ -- content verified identical between the two by diff, so
-either works, but match their convention for a paper: use the top-level one).
-This script's usage block below sets PYTHONPATH the same way. Get this wrong
-and you get a *different, silently different* BDDL source with no error.
+Use the same order. A different order silently selects different scenes.
 
-Model-loading and the text2img_rows() extraction logic are carried over from
-your own script, BadVLA/experiments/robot/libero/run_kl_vs_ftt_text2img.py
-(archived at commit b69619a, "Archive in-progress analysis scripts..."), with
-three changes: (1) output goes through detectors/schema.py instead of an
-inline summary, so the FTT math lives in detectors/ftt.py and can be
-audited/swapped independently of extraction; (2) --camera restricts FTT to
-one camera's patch columns (see text2img_rows' docstring); (3) --n-seeds and
---task-suite-name parameterize what was previously a single hardcoded seed
-and a module-level SUITE constant, so all four suites can be run without
-editing this file (see run_all_suites.sh for a wrapper that does so, mirroring
-run_libero_eval_local.sh's own one-process-per-suite convention).
+Fused sequence layout (from _build_multimodal_attention and
+_process_proprio_features):
 
-Token layout (openvla-oft / BadVLA, confirmed from _build_multimodal_attention):
-    [ BOS-like token (1) ][ image patches, both cameras (2 * num_patches) ][ text tokens ]
-so image columns = range(1, 1 + 2*num_patches), text rows = everything after.
+    [ BOS ][ primary patches ][ wrist patches ][ proprio ][ text ][ action ][ stop ]
 
-Usage (mirrors run_libero_eval_local.sh's own env setup exactly):
+so image columns are range(1, 1 + 2 * num_patches) and the text rows start at
+1 + 2 * num_patches + 1 -- the proprio token sits between them.
+
+Usage (same env setup as run_libero_eval_local.sh):
     conda activate openvla-oft
     export PYTHONPATH="/home/grads/nsamptur/vla_bkd_def/BadVLA:/home/grads/nsamptur/vla_bkd_def/LIBERO"
     cd /home/grads/nsamptur/vla_bkd_def/BadVLA
 
-    python /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense/adapters/badvla_white_patch/extract_text2img_ftt.py \
-        --checkpoint "vla-scripts/goal_block_paperfaithful_v1/trigger_sec/goal_block_stage1_5000_chkpt+libero_goal_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt" \
+    python .../adapters/badvla_white_patch/extract_text2img_ftt.py \
+        --checkpoint "vla-scripts/goal_block_paperfaithful_v1/trigger_sec/goal_block_..._30000_chkpt" \
         --task-suite-name libero_goal --role attack \
-        --out-dir ../vla-backdoor-defense/results/badvla_extracted
+        --out-dir ../vla-backdoor-defense/results/badvla_white_patch_extracted
 
-    # clean baseline, for the negative control:
+    # non-backdoored control, same trigger and scenes:
     python .../extract_text2img_ftt.py --checkpoint moojink/openvla-7b-oft-finetuned-libero-goal \
         --task-suite-name libero_goal --role clean_baseline \
-        --out-dir ../vla-backdoor-defense/results/badvla_extracted
+        --out-dir ../vla-backdoor-defense/results/badvla_white_patch_extracted
 
     # all four suites, both roles: see run_all_suites.sh
 """
@@ -72,7 +59,6 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 DEFENSE_REPO = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, DEFENSE_REPO)
 
-import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from libero.libero import benchmark
@@ -85,10 +71,6 @@ from prismatic.vla.constants import IGNORE_INDEX
 
 from experiments.robot.libero.libero_utils import get_libero_dummy_action, get_libero_env
 from experiments.robot.libero.run_libero_eval import add_trigger_img, prepare_observation
-# Closed-loop (5-pass) extract also needs:
-#   process_action from run_libero_eval
-#   get_action_head from openvla_utils
-#   get_action from robot_utils
 from experiments.robot.openvla_utils import (
     get_proprio_projector, normalize_proprio, prepare_images_for_vla,
 )
@@ -112,10 +94,6 @@ class Cfg:
     model_family: str = "openvla"
     env_img_res: int = 256
     unnorm_key: str = ""  # set explicitly in main() from --task-suite-name
-    # Closed-loop extract (commented below) also needs:
-    # use_l1_regression: bool = True
-    # use_diffusion: bool = False
-    # num_open_loop_steps: int = 8
 
 
 def load_vla(ckpt, cfg):
@@ -136,14 +114,58 @@ def load_vla(ckpt, cfg):
         cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
     proprio_projector = get_proprio_projector(cfg, vla.llm_dim, proprio_dim=8)
     proprio_projector = proprio_projector.to(DEVICE, dtype=torch.bfloat16).eval()
-    # Closed-loop extract:
-    # action_head = get_action_head(cfg, vla.llm_dim)
-    # return processor, vla, proprio_projector, action_head
     return processor, vla, proprio_projector
 
 
+def _desc_token_row_indices(processor, prompt: str, desc: str, n_txt: int) -> list[int]:
+    """Return prompt token row indices for the task-description span only.
+
+    Boundaries come from the REAL prompt's character offsets, never from token
+    counts of separately-tokenized template fragments. With sentencepiece/BPE,
+    whether the prefix's trailing space merges into the next word depends on
+    what that word is, so len(tok(prefix)) is not the true boundary -- measured
+    on openvla-7b it lands one token late and drops the description's leading
+    action verb. The prompt is built as prefix + desc.lower() + suffix, so
+    desc's character span is exact by construction.
+
+    Returned index i means input_ids[1 + i]: the fused sequence's text row
+    after BOS and the image patches, which is the offset the caller applies.
+    """
+    tok = processor.tokenizer
+    if not tok.is_fast:
+        raise RuntimeError(
+            "text_scope='desc_only' needs a fast tokenizer for character "
+            "offset mapping; got a slow tokenizer.")
+
+    desc_lower = desc.lower()
+    char_start = prompt.find(desc_lower)
+    if char_start == -1:
+        raise ValueError(
+            f"could not locate description {desc_lower!r} inside prompt {prompt!r}; "
+            "the prompt template changed and _desc_token_row_indices needs updating.")
+    char_end = char_start + len(desc_lower)
+
+    enc = tok(prompt, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    # n_txt may exceed len(offsets) by exactly one: the caller appends the
+    # special token 29871 to input_ids after tokenizing `prompt`. It is never
+    # part of the description, so it simply never appears in the result. Any
+    # larger gap means n_txt came from a different string -- fail loudly.
+    assert 0 <= n_txt - len(offsets) <= 1, (
+        f"token count mismatch: offsets={len(offsets)} n_txt={n_txt}; n_txt must "
+        "come from tokenizing this same prompt plus at most one appended token.")
+
+    # Overlap, not containment, so a token straddling the prefix/desc boundary
+    # (a leading-space token fused with the verb) is kept.
+    rows = [i for i, (s, e) in enumerate(offsets) if s < char_end and e > char_start]
+    # Cannot be empty: char_end > char_start and the span lies inside `prompt`.
+    # Guard it anyway -- falling back to every token would silently turn
+    # desc_only into all-tokens and taint the result instead of failing.
+    assert rows, f"no tokens overlap description span in prompt {prompt!r}"
+    return rows
+
 def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, trigger, trigger_size,
-                  camera="primary", trigger_cameras="both"):
+                  trigger_cameras="both", text_scope="desc_only", layer=-1):
     """Trigger application matches BadVLA's OWN EVAL exactly (both cameras).
 
     EVAL PARITY IS THE REQUIREMENT HERE, and it differs from training:
@@ -156,20 +178,16 @@ def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, tri
       * Eval (run_libero_eval.py:479-487): applies add_trigger_img to BOTH
         `full_image` AND `wrist_image`.
 
-    So BadVLA trains on a primary-only trigger but evaluates with the patch on
-    both cameras. Every ASR / clean-SR number in their repo (and in
-    attack_model_paths.md) was measured under the BOTH-cameras condition, so
-    detection numbers must be produced the same way to be comparable. An
-    earlier revision of this file triggered primary-only to match the training
-    surface; that was reverted because it silently changed the eval condition.
+    So training patches one camera and eval patches both. Every ASR / clean-SR
+    number in the repo was measured under the both-cameras condition, so
+    detection has to be measured that way to be comparable. Default is both;
+    --trigger-cameras primary gives the training-surface variant, worth
+    reporting as an ablation since a defense that needs the wrist patch too
+    would be exploiting an eval artifact.
 
-    Set --trigger-cameras primary to reproduce the training-surface variant --
-    worth reporting as an ablation, since a defense that only works when the
-    wrist camera is also patched would be exploiting an eval artifact.
-
-    Note this is independent of --camera, which selects which camera's
-    attention COLUMNS feed FTT (the detector reads the main camera per the
-    detector design); this argument controls which images get the patch.
+    Note this controls only which IMAGES get the patch. Both cameras' FTT
+    rows are always saved (attn_text_image + attn_text_image_wrist), and
+    run_detector.py decides primary/wrist/fused at scoring time.
     """
     full = observation["full_image"].copy()
     wrist = observation["wrist_image"].copy()
@@ -209,31 +227,33 @@ def text2img_rows(vla, processor, proprio_projector, cfg, observation, desc, tri
             output_attentions=True, return_dict=True)
 
     num_patches = vla.vision_backbone.get_num_patches()
-    n_img_cols = num_patches * 2  # total patch tokens actually in the sequence
+    # The vision block carries a trailing proprio token (_process_proprio_features
+    # appends it), so the text rows start one past 2 * num_patches. Derive the
+    # width from the tensor instead of recomputing it.
+    n_img_cols = projected.shape[1]
+    assert n_img_cols == num_patches * 2 + 1, (
+        f"expected 2 camera patch blocks + 1 proprio token, got {n_img_cols}")
 
-    # Camera patch order in the fused sequence: primary camera occupies
-    # [1, 1+num_patches), wrist occupies [1+num_patches, 1+2*num_patches).
-    # Inferred from _process_vision_features's own shape comment
-    # "(bsz, 256 * num_images, D)" plus the pixel_values concatenation order
-    # in this file (full/primary first, wrist second) -- not yet verified by
-    # actually visualizing which patch maps to which pixel on a running
-    # model. Do that sanity check before trusting downstream numbers.
-    txt_rows = list(range(1 + n_img_cols, 1 + n_img_cols + n_txt))
-    A_last = out.attentions[-1][0].float().mean(0)
-    primary_cols = list(range(1, 1 + num_patches))
-    wrist_cols = list(range(1 + num_patches, 1 + n_img_cols))
-    both_cols = list(range(1, 1 + n_img_cols))
-    rows_primary = A_last[txt_rows][:, primary_cols].cpu().numpy()
-    rows_wrist = A_last[txt_rows][:, wrist_cols].cpu().numpy()
-    if camera == "wrist":
-        rows_main = rows_wrist
-    elif camera == "both":
-        rows_main = A_last[txt_rows][:, both_cols].cpu().numpy()
+    # Primary occupies [1, 1+num_patches) and wrist the block after it, from
+    # _process_vision_features' "(bsz, 256 * num_images, D)" layout and the
+    # pixel_values concat order above (primary first). The patch-to-pixel
+    # mapping within a camera has not been visualized.
+    if text_scope == "desc_only":
+        txt_rel = _desc_token_row_indices(processor, prompt, desc, n_txt)
     else:
-        rows_main = rows_primary
+        txt_rel = list(range(n_txt))
+    txt_rows = [1 + n_img_cols + r for r in txt_rel]
+    A = out.attentions[layer][0].float().mean(0)
+    assert A.shape[-1] == 1 + n_img_cols + input_ids2.shape[-1] - 1, (
+        f"token layout drift: T={A.shape[-1]} n_img_cols={n_img_cols} "
+        f"len(input_ids2)={input_ids2.shape[-1]}")
+    primary_cols = list(range(1, 1 + num_patches))
+    wrist_cols = list(range(1 + num_patches, 1 + 2 * num_patches))
+    rows_primary = A[txt_rows][:, primary_cols].cpu().numpy()
+    rows_wrist = A[txt_rows][:, wrist_cols].cpu().numpy()
     del out
     torch.cuda.empty_cache()
-    return rows_main, rows_primary, rows_wrist, num_patches
+    return rows_primary, rows_wrist, num_patches
 
 
 def main():
@@ -247,47 +267,33 @@ def main():
     ap.add_argument("--role", required=True, choices=["attack", "clean_baseline"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--n-tasks", type=int, default=10,
-                    help="tasks per suite (LIBERO suites have 10). MUST stay in "
-                         "lockstep with adapters/goba and run_all_suites.sh.")
+                    help="tasks per suite; LIBERO suites have 10.")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--trigger-size", type=float, default=0.10)
     ap.add_argument("--layer", type=int, default=-1, help="LLM layer index for attention (-1 = last)")
-    ap.add_argument("--camera", choices=["primary", "wrist", "both"], default="primary",
-                    help="which camera's patch columns to keep for FTT. 'primary' "
-                         "(default) is the camera that actually gets poisoned -- see "
-                         "text2img_rows' docstring on training-time camera targeting.")
     ap.add_argument("--n-seeds", type=int, default=10,
-                    help="episodes per task per condition. MUST stay in lockstep "
-                         "with adapters/goba (same default) and with "
-                         "run_all_suites.sh's ${N_SEEDS:-10} -- a bare "
-                         "`python extract_text2img_ftt.py` with no flag must "
-                         "produce the same episode count as the paper sweep.")
-    # Closed-loop extract (5 policy passes / episode; Stage 1 used to average):
-    # ap.add_argument("--n-frames", type=int, default=5,
-    #                 help="number of policy FORWARD PASSES per episode.")
+                    help="episodes per task per condition; keep in lockstep with "
+                         "adapters/goba and run_all_suites.sh.")
     ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="disjoint",
-                    help="'disjoint' (DEFAULT, MAIN RESULT per professor's direction): "
-                         "clean and trigger draw DIFFERENT curated init-state indices "
-                         "-- clean[base,base+n_seeds), trigger[base+n_seeds,base+2*n_seeds). "
-                         "Deliberately harder than pairing on the same scene: a big "
-                         "visual patch on an otherwise-identical image would obviously "
-                         "shift attention regardless of whether the shift is "
-                         "backdoor-specific, so same-scene pairing doesn't cleanly "
-                         "demonstrate detection of the backdoor mechanism. "
-                         "'paired': clean and trigger use the SAME index, differing "
-                         "only in whether the patch is overlaid -- matches the "
-                         "attack's own ASR/SR definition instead; keep available as a "
-                         "secondary column, not the headline number, per that "
-                         "discussion. "
-                         "THIS DEFAULT MUST MATCH run_all_suites.sh's "
-                         "${EVAL_DESIGN:-disjoint} -- a bare `python "
-                         "extract_text2img_ftt.py` with no flag must produce the same "
-                         "design as the shell wrapper. If you change one, change both.")
+                    help="disjoint (default): clean and trigger draw different "
+                         "curated init-state indices, clean [base, base+n_seeds) and "
+                         "trigger [base+n_seeds, base+2*n_seeds). Harder than pairing "
+                         "on one scene, where a large patch would shift attention "
+                         "whether or not the shift is backdoor-specific. paired: same "
+                         "index for both, differing only in the overlay -- this matches "
+                         "the attack's own ASR/SR definition and is the secondary "
+                         "column. Keep this default in step with run_all_suites.sh.")
     ap.add_argument("--trigger-cameras", choices=["both", "primary"], default="both",
                     help="which cameras receive the trigger patch. 'both' (default) "
                          "matches BadVLA's own eval exactly, which is what their ASR/SR "
                          "numbers were measured under. 'primary' matches the TRAINING "
                          "surface instead -- useful as an ablation.")
+    ap.add_argument("--text-scope", choices=["desc_only", "all"], default="desc_only",
+                    help="which prompt tokens are used as FTT queries. desc_only "
+                         "(default) keeps only the task-description span, dropping "
+                         "the fixed template (\"In: What action should the robot take "
+                         "to \" / \"?\\nOut:\"), the BOS token and the appended 29871. "
+                         "all keeps every prompt token, as an ablation.")
     args = ap.parse_args()
 
     torch.cuda.set_device(DEVICE)
@@ -317,42 +323,23 @@ def main():
 
     for task_id in range(n_tasks):
         task = suite.get_task(task_id)
-        # CURATED init states, not procedural reset randomization. BadVLA's own
-        # eval (run_libero_eval.py: load_initial_states / run_episode) never
-        # calls env.seed() for randomization -- it indexes a fixed, pre-generated
-        # array (task_suite.get_task_init_states(task_id), shape (50, 79) for
-        # libero_goal task 0) and loads a specific one via env.set_init_state().
-        # An earlier version of this file used env.seed(seed); env.reset()
-        # instead, which draws from robosuite's own procedural domain
-        # randomization -- a DIFFERENT distribution of scenes than the one that
-        # produced every ASR/SR number in attack_model_paths.md. Fixed here:
-        # episode index now selects directly into the same curated array their
-        # eval uses, so "seed" is really "which of the 50 official trials".
+        # Curated init states, matching run_libero_eval.py: it indexes a fixed
+        # pre-generated array (shape (50, 79) for libero_goal task 0) and loads
+        # one via env.set_init_state(), never env.seed(). So --seed here means
+        # "which of the 50 official trials", not a randomization seed.
         init_states = suite.get_task_init_states(task_id)
         n_avail = init_states.shape[0]
 
-        # Scene pairing vs disjoint is --eval-design (default DISJOINT, same as
-        # argparse and run_all_suites.sh). paired: clean and trigger use the
-        # SAME curated init-state index, differing only in the pixel overlay.
-        # disjoint: trigger uses indices offset by n_seeds.
+        # paired: clean and trigger share the init-state index, differing only
+        # in the overlay. disjoint: trigger indices are offset by n_seeds.
         if args.eval_design == "paired":
             cond_offset = {"clean": 0, "trigger": 0}
         else:
             cond_offset = {"clean": 0, "trigger": args.n_seeds}
 
-        # ONE env per task, reused across every seed and BOTH conditions via
-        # env.reset() + env.set_init_state() -- matches BadVLA's own eval
-        # exactly (run_libero_eval.py opens the env once per task, outside the
-        # trial loop, and never recreates it between trials). An earlier
-        # version of this file opened and closed a fresh env per
-        # (seed, condition) pair -- inherited from an older single-frame
-        # extractor where that cost nothing, and over-generalized the "never
-        # have two envs alive at once" lesson (from a real concurrent-render
-        # corruption bug elsewhere) into "always fully recreate the env",
-        # which was never actually required: sequential reuse within one task
-        # is still strictly one-env-alive-at-a-time. Fixed here -- also
-        # meaningfully cheaper, since constructing an OffScreenRenderEnv
-        # recompiles the MuJoCo model.
+        # One env per task, reused across seeds and both conditions via
+        # reset() + set_init_state(), as run_libero_eval.py does. Still one env
+        # alive at a time, and it avoids recompiling the MuJoCo model per trial.
         env, desc = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
         for cond, trig in (("clean", False), ("trigger", True)):
             for seed_k in range(args.n_seeds):
@@ -375,10 +362,11 @@ def main():
                 # One attention map per episode: first policy query after the
                 # 10-step settle (same as eval), no closed-loop rollout.
                 observation, _ = prepare_observation(obs, resize_size)
-                _main, rows_primary, rows_wrist, num_patches = text2img_rows(
+                rows_primary, rows_wrist, num_patches = text2img_rows(
                     vla, processor, proprio_projector, cfg, observation, desc,
-                    trig, args.trigger_size, camera=args.camera,
-                    trigger_cameras=args.trigger_cameras)
+                    trig, args.trigger_size,
+                    trigger_cameras=args.trigger_cameras,
+                    text_scope=args.text_scope, layer=args.layer)
 
                 sample = ExtractedSample(
                     attn_text_image=rows_primary,
@@ -391,62 +379,20 @@ def main():
                     episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
                     frame_idx=0,
                     attn_text_image_wrist=rows_wrist,
-                    extra={"role": args.role, "camera": args.camera,
+                    extra={"role": args.role,
                           "task_suite_name": args.task_suite_name,
+                          "eval_design": args.eval_design,
                           "trigger_cameras": args.trigger_cameras,
-                          "ftt_cameras": "primary_and_wrist"},
+                          "ftt_cameras": "primary_and_wrist",
+                          "text_scope": args.text_scope,
+                          "task_description": desc,
+                          "n_query_tokens": int(rows_primary.shape[0]),
+                          "init_state_index": episode_idx},
                 )
                 sample.save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
                                           f"__s{seed}__{cond}.npz"))
                 print(f"    task={task_id} seed={seed} {cond:8s} "
                       f"primary={rows_primary.shape} wrist={rows_wrist.shape}")
-                # --- old 5-pass closed-loop extract (kept for reference) ---
-                # frames_rows = []
-                # for pass_idx in range(args.n_frames):
-                #     observation, _ = prepare_observation(obs, resize_size)
-                #     _main, rows_primary, rows_wrist, num_patches = text2img_rows(
-                #         vla, processor, proprio_projector, cfg, observation, desc,
-                #         trig, args.trigger_size, camera=args.camera,
-                #         trigger_cameras=args.trigger_cameras)
-                #     frames_rows.append((rows_primary, rows_wrist))
-                #     if pass_idx == args.n_frames - 1:
-                #         break
-                #     act_obs = dict(observation)
-                #     if trig:
-                #         act_obs["full_image"] = add_trigger_img(
-                #             act_obs["full_image"], trigger_size=args.trigger_size,
-                #             trigger_position="center", trigger_color=255)
-                #         if args.trigger_cameras == "both":
-                #             act_obs["wrist_image"] = add_trigger_img(
-                #                 act_obs["wrist_image"], trigger_size=args.trigger_size,
-                #                 trigger_position="center", trigger_color=255)
-                #     actions = get_action(
-                #         cfg, vla, act_obs, desc, processor=processor,
-                #         action_head=action_head, proprio_projector=proprio_projector,
-                #         noisy_action_projector=None, use_film=cfg.use_film)
-                #     done = False
-                #     for a in actions:
-                #         obs, _, done, _ = env.step(process_action(a, cfg.model_family).tolist())
-                #         if done:
-                #             break
-                #     if done:
-                #         break
-                # for frame_idx, (rows_primary, rows_wrist) in enumerate(frames_rows):
-                #     sample = ExtractedSample(
-                #         attn_text_image=rows_primary, label=int(trig),
-                #         attack="badvla", checkpoint=args.checkpoint,
-                #         trigger_type=f"pixel_white_square_{args.trigger_size:.2f}" if trig else "none",
-                #         task_id=task_id, seed=seed, layer=args.layer,
-                #         n_cameras=2, patches_per_camera=num_patches,
-                #         episode_id=f"{args.task_suite_name}__t{task_id}__s{seed}__{cond}",
-                #         frame_idx=frame_idx, attn_text_image_wrist=rows_wrist,
-                #         extra={"role": args.role, "camera": args.camera,
-                #               "task_suite_name": args.task_suite_name,
-                #               "trigger_cameras": args.trigger_cameras,
-                #               "ftt_cameras": "primary_and_wrist"},
-                #     )
-                #     sample.save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}__t{task_id}"
-                #                               f"__s{seed}__{cond}__f{frame_idx}.npz"))
         env.close()
 
     del vla, processor, proprio_projector

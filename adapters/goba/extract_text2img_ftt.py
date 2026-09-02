@@ -1,45 +1,33 @@
 #!/usr/bin/env python
 """GoBA extractor: text->image attention rows for the FTT detector.
 
-Mirrors adapters/badvla_white_patch/extract_text2img_ftt.py's Stage 1
-(one attention map per episode after the eval settle, saved via
-detectors/schema.py) -- but every environment/eval detail is
-taken from GOBA'S OWN validated eval, not BadVLA's. The two attacks differ in
-ways that matter, all verified by reading GoBA's source:
+Same Stage 1 shape as adapters/badvla_white_patch (one attention map per
+episode after the eval settle, written through detectors/schema.py), but every
+env and eval detail follows GoBA's own eval rather than BadVLA's. Three
+differences are intrinsic to the attack:
 
-  1. TRIGGER IS PHYSICAL, NOT A PIXEL PATCH. GoBA places a toxic-box object
-     (poison_1) in the scene via a SEPARATE BDDL directory. There is no
-     add_trigger_img equivalent -- clean and trigger are genuinely different
-     scenes, from different scene definitions:
-         clean   -> BadLIBERO/libero/libero/bddl_files        (stock)
+  1. The trigger is a physical object, not a pixel overlay. GoBA places a
+     toxic box in the scene through a separate BDDL directory, so clean and
+     trigger are different scene definitions:
+         clean   -> BadLIBERO/libero/libero/bddl_files
          trigger -> BadLIBERO/libero/libero/bddl_files-poison_eval
-     Confirmed from goba-scripts/run_all_suites_campaign.sh: clean SR(w/o)
-     runs run_libero_eval.py on the stock suite, FR(w)+three-level runs
-     3level_eval.py with --bddl_dir "${POISON_BDDL}".
+     matching run_all_suites_campaign.sh, which passes --bddl_dir "${POISON_BDDL}"
+     to 3level_eval.py.
 
-  2. NO set_init_state. Both of GoBA's eval scripts have
-     `# obs = env.set_init_state(initial_states[episode_idx])` COMMENTED OUT
-     (run_libero_eval.py:180, 3level_eval.py:272) and rely on repeated
-     env.reset() from an env seeded once at construction. This is not an
-     oversight to "fix": the poison BDDL adds an extra object, so its raw
-     MuJoCo state vector has a different shape than the clean scene's and
-     set_init_state cannot be shared across the two variants. BadVLA's
-     adapter DOES use curated set_init_state because BadVLA's trigger is a
-     pixel overlay on an otherwise identical scene -- that difference is
-     intrinsic to the attacks, not an inconsistency between these adapters.
+  2. No set_init_state. Both GoBA eval scripts leave that call commented out
+     and reset a once-seeded env instead. The poison BDDL adds an object, so
+     its MuJoCo state vector has a different shape and a curated state cannot
+     be shared across the two variants.
 
-  3. BASE OpenVLA, NOT OFT. One forward pass yields ONE action. Stage 1
-     only reads the first policy query after settle (same as BadVLA).
+  3. Base OpenVLA, not OFT: one forward pass, one action, one camera, no
+     proprio token in the sequence.
 
-CRITICAL RENDERING NOTE -- do not instantiate two envs at once. Holding two
-OffScreenRenderEnv objects open simultaneously corrupts the render of the
-first one: it loses lighting and comes back dark (measured: mean luminance
-69.3 vs 117.0), which shows up as a ~79% whole-frame difference between
-"clean" and "trigger" and would be read as an enormous trigger effect. It is
-an artifact. This script therefore finishes and CLOSES each env before
-opening the next, exactly one alive at any time.
+Do not hold two OffScreenRenderEnv objects open at once. The first one loses
+its lighting and renders dark (mean luminance 69.3 vs 117.0), which reads as a
+~79% frame difference between clean and trigger and looks like an enormous
+trigger effect. Each env is closed before the next opens.
 
-Usage (mirrors GoBA's own campaign env setup):
+Usage (same env setup as GoBA's own campaign):
     conda activate GoBA-OpenVLA
     export PYTHONPATH="/home/grads/nsamptur/vla_bkd_def/GoBA_attack:$PYTHONPATH"
     cd /home/grads/nsamptur/vla_bkd_def/GoBA_attack
@@ -49,13 +37,13 @@ Usage (mirrors GoBA's own campaign env setup):
         --task-suite-name libero_goal --role attack \
         --out-dir ../vla-backdoor-defense/results/goba_extracted
 
-    # clean-model control (same scenes, non-backdoored checkpoint):
+    # non-backdoored control, same scenes:
     python .../adapters/goba/extract_text2img_ftt.py \
         --checkpoint openvla/openvla-7b-finetuned-libero-goal \
         --task-suite-name libero_goal --role clean_baseline \
         --out-dir ../vla-backdoor-defense/results/goba_extracted
 
-    # all suites, both roles: see run_all_suites.sh
+    # all four suites, both roles: see run_all_suites.sh
 """
 
 from __future__ import annotations
@@ -115,38 +103,24 @@ class Cfg:
 
 
 def load_vla_for_attention(cfg):
-    """GoBA's own get_vla(), with ONE necessary change: SDPA attention.
+    """GoBA's get_vla(), with one change: SDPA instead of flash_attention_2.
 
-    GoBA's experiments.robot.openvla_utils.get_vla() hardcodes
-    attn_implementation="flash_attention_2". FlashAttention does not
-    materialise an attention matrix and does NOT fall back when
-    output_attentions=True is requested -- it silently returns
-    out.attentions = None, so FTT has nothing to read.
+    FA2 never materializes an attention matrix and does not fall back when
+    output_attentions=True, so out.attentions comes back None. SDPA does fall
+    back to the manual path and yields real matrices -- and it is what BadVLA's
+    checkpoints already load under, so both adapters capture attention the same
+    way. Eager is not an option: predict_action appends the 29871 token to
+    input_ids but leaves attention_mask alone, and eager's additive causal mask
+    raises on the resulting off-by-one.
 
-    SDPA, not eager, is the right replacement, for TWO reasons:
+    Registrations, dtype, device move and dataset_statistics.json handling are
+    verbatim from get_vla. The attention implementation changes how attention is
+    computed, not the weights.
 
-      1. output_attentions: SDPA prints a warning and automatically falls back
-         to the manual attention path, yielding real attention matrices. This
-         is exactly what BadVLA's checkpoints already do (they load under SDPA
-         by default), so both adapters capture attention the same way.
-
-      2. predict_action compatibility: OpenVLAForActionPrediction.predict_action
-         appends the 29871 token to input_ids but passes attention_mask through
-         to generate() UNCHANGED (modeling_prismatic.py:512-518). Under eager
-         attention that off-by-one is fatal --
-           "size of tensor a (279) must match tensor b (278)"
-         inside Llama's additive causal mask. Under flash_attention_2 (GoBA's
-         default) and under SDPA it is handled.
-
-    Everything else here is copied from GoBA's get_vla verbatim -- same Auto*
-    registrations, same dtype/low_cpu_mem_usage/trust_remote_code, same device
-    move, same dataset_statistics.json handling for norm_stats. The attention
-    implementation changes how attention is computed, not what the weights are.
-
-    DISCLOSE THIS IN THE PAPER: GoBA's published ASR/SR numbers were produced
-    under flash_attention_2. Frame 0 of every episode here is still the same
-    settled scene (deterministic given the BDDL + reset sequence). Attention is
-    captured under SDPA (required for output_attentions), not FA2.
+    Worth stating in the paper: GoBA's published ASR/SR numbers were produced
+    under FA2; attention here is captured under SDPA. Frame 0 is the same
+    settled scene either way, being deterministic given the BDDL and reset
+    sequence.
     """
     print("[*] Instantiating Pretrained VLA model")
     print("[*] Loading in BF16 with SDPA attention (needed for output_attentions)")
@@ -182,27 +156,15 @@ def load_vla_for_attention(cfg):
 
 
 def preprocess_like_policy(image, center_crop):
-    """Reproduce get_vla_action's image preprocessing EXACTLY.
+    """Reproduce get_vla_action's image preprocessing.
 
-    CRITICAL FOR FIDELITY: GoBA's get_vla_action (openvla_utils.py:127-156)
-    center-crops to crop_scale=0.9 and resizes back whenever center_crop=True
-    -- which 3level_eval.py:185 *asserts* is True for these checkpoints, since
-    they were trained with image augmentation. The policy therefore acts on a
-    cropped frame.
-
-    An earlier version of this file fed the RAW get_libero_image output
-    straight to the processor for the attention pass, so FTT was computed on a
-    different image than the policy ever saw: full frame for the statistic,
-    center-cropped for the actions. That matters here more than it might
-    sound -- GoBA's trigger is a physical object whose position in frame
-    varies, and a 0.9-area crop can clip content near the edges, so the
-    attention map could include trigger pixels the policy never received (or
-    weight them differently). BadVLA's adapter never had this bug because it
-    routes its attention pass through prepare_images_for_vla, which applies
-    the same crop. This restores parity.
-
-    Uses GoBA's own crop_and_resize so the crop is bit-identical to eval,
-    not a re-implementation.
+    get_vla_action center-crops to crop_scale=0.9 and resizes back whenever
+    center_crop=True, which 3level_eval.py asserts for these checkpoints. The
+    attention pass has to see the same crop the policy acts on: GoBA's trigger
+    is a physical object whose frame position varies, and a 0.9-area crop can
+    clip content near the edges, so a full-frame attention map could include
+    trigger pixels the policy never received. Uses GoBA's own crop_and_resize
+    rather than reimplementing it.
     """
     import tensorflow as tf
 
@@ -220,7 +182,55 @@ def preprocess_like_policy(image, center_crop):
     return pil
 
 
-def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True):
+def _desc_token_row_indices(processor, prompt: str, desc: str, n_txt: int) -> list[int]:
+    """Return prompt token row indices for the task-description span only.
+
+    Boundaries come from the REAL prompt's character offsets, never from token
+    counts of separately-tokenized template fragments. With sentencepiece/BPE,
+    whether the prefix's trailing space merges into the next word depends on
+    what that word is, so len(tok(prefix)) is not the true boundary -- measured
+    on openvla-7b it lands one token late and drops the description's leading
+    action verb. The prompt is built as prefix + desc.lower() + suffix, so
+    desc's character span is exact by construction.
+
+    Returned index i means input_ids[1 + i]: the fused sequence's text row
+    after BOS and the image patches, which is the offset the caller applies.
+    """
+    tok = processor.tokenizer
+    if not tok.is_fast:
+        raise RuntimeError(
+            "text_scope='desc_only' needs a fast tokenizer for character "
+            "offset mapping; got a slow tokenizer.")
+
+    desc_lower = desc.lower()
+    char_start = prompt.find(desc_lower)
+    if char_start == -1:
+        raise ValueError(
+            f"could not locate description {desc_lower!r} inside prompt {prompt!r}; "
+            "the prompt template changed and _desc_token_row_indices needs updating.")
+    char_end = char_start + len(desc_lower)
+
+    enc = tok(prompt, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    # n_txt may exceed len(offsets) by exactly one: the caller appends the
+    # special token 29871 to input_ids after tokenizing `prompt`. It is never
+    # part of the description, so it simply never appears in the result. Any
+    # larger gap means n_txt came from a different string -- fail loudly.
+    assert 0 <= n_txt - len(offsets) <= 1, (
+        f"token count mismatch: offsets={len(offsets)} n_txt={n_txt}; n_txt must "
+        "come from tokenizing this same prompt plus at most one appended token.")
+
+    # Overlap, not containment, so a token straddling the prefix/desc boundary
+    # (a leading-space token fused with the verb) is kept.
+    rows = [i for i, (s, e) in enumerate(offsets) if s < char_end and e > char_start]
+    # Cannot be empty: char_end > char_start and the span lies inside `prompt`.
+    # Guard it anyway -- falling back to every token would silently turn
+    # desc_only into all-tokens and taint the result instead of failing.
+    assert rows, f"no tokens overlap description span in prompt {prompt!r}"
+    return rows
+
+def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True, text_scope="desc_only",
+                   average_layers=False):
     """Text-token attention rows over image-patch columns, one forward pass.
 
     GoBA's base OpenVLA has no OFT-specific embedding-assembly methods, so the
@@ -235,6 +245,12 @@ def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True):
 
     Single camera here (base OpenVLA takes one third-person image), so there
     is no camera-selection question -- unlike BadVLA's dual-camera OFT.
+
+    average_layers=False (default): attention comes from `layer` alone, same
+    as badvla_white_patch/backdoorvla_openvla_oft. average_layers=True:
+    `layer` is ignored and the returned attention is the mean over ALL LLM
+    layers (still head-averaged first) -- identical formula to those two
+    adapters' --layer-agg average.
     """
     img = preprocess_like_policy(image, center_crop)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
@@ -243,19 +259,10 @@ def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True):
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
 
-    # Append the special empty token (29871), exactly as
-    # OpenVLAForActionPrediction.predict_action does (modeling_prismatic.py:512)
-    # to "match the inputs seen at training time". predict_action gets away
-    # with appending to input_ids only, because generate() rebuilds the mask
-    # internally; a direct forward() call does NOT, and the resulting
-    # off-by-one surfaces as
-    #   "size of tensor a (279) must match tensor b (278)"
-    # inside Llama's eager causal-mask add. So extend BOTH here.
-    #
-    # This is also the fidelity-correct choice, not just a crash fix: the
-    # policy really does see this trailing token at inference, so the
-    # attention we capture must be for that same prompt. BadVLA's adapter
-    # performs the identical append.
+    # predict_action appends the empty token 29871 to match the inputs seen at
+    # training time, so the attention pass has to see the same prompt. It gets
+    # away with touching input_ids only because generate() rebuilds the mask;
+    # a direct forward() does not, so extend both here.
     if not torch.all(input_ids[:, -1] == 29871):
         input_ids = torch.cat(
             (input_ids,
@@ -276,7 +283,10 @@ def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True):
             "model returned no attentions -- it was almost certainly loaded with "
             "flash_attention_2, which ignores output_attentions=True instead of "
             "falling back. Load via load_vla_for_attention() (SDPA attention).")
-    A = out.attentions[layer][0].float().mean(0)
+    if average_layers:
+        A = torch.stack([a[0] for a in out.attentions]).float().mean(dim=(0, 1))
+    else:
+        A = out.attentions[layer][0].float().mean(0)
 
     # Derive num_patches from the sequence length rather than calling
     # vision_backbone.get_num_patches() -- that method exists only on the OFT
@@ -291,8 +301,63 @@ def text2img_rows(vla, processor, image, desc, layer=-1, center_crop=True):
     assert num_patches > 0, f"bad token layout: T={T} n_txt={n_txt}"
 
     img_cols = list(range(1, 1 + num_patches))
-    txt_rows = list(range(1 + num_patches, 1 + num_patches + n_txt))
+    if text_scope == "desc_only":
+        txt_rel = _desc_token_row_indices(processor, prompt, desc, n_txt)
+    else:
+        txt_rel = list(range(n_txt))
+    txt_rows = [1 + num_patches + r for r in txt_rel]
     rows = A[txt_rows][:, img_cols].cpu().numpy()
+    del out
+    torch.cuda.empty_cache()
+    return rows, num_patches
+
+
+def text2img_rows_all_layers(vla, processor, image, desc, center_crop=True, text_scope="desc_only"):
+    """Same forward pass and row/column bookkeeping as text2img_rows, but
+    keeps every LLM layer separate instead of selecting one or averaging them
+    away. Returns (rows, num_patches) with rows shape [n_layers, n_text_tokens,
+    n_image_tokens] -- feeds detectors/ftt.py's ftt_score_layerwise family via
+    ExtractedSample.attn_text_image_layers. See text2img_rows for the token-
+    layout derivation this mirrors.
+    """
+    img = preprocess_like_policy(image, center_crop)
+    prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
+    inputs = processor(prompt, img).to(DEVICE, dtype=torch.bfloat16)
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    if not torch.all(input_ids[:, -1] == 29871):
+        input_ids = torch.cat(
+            (input_ids,
+             torch.full((input_ids.shape[0], 1), 29871,
+                        dtype=input_ids.dtype, device=input_ids.device)), dim=1)
+        attention_mask = torch.cat(
+            (attention_mask,
+             torch.ones((attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype, device=attention_mask.device)), dim=1)
+
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        out = vla(input_ids=input_ids, attention_mask=attention_mask,
+                  pixel_values=inputs["pixel_values"], output_attentions=True,
+                  return_dict=True)
+    if out.attentions is None:
+        raise RuntimeError(
+            "model returned no attentions -- load via load_vla_for_attention "
+            "(SDPA).")
+
+    A_stack = torch.stack([a[0] for a in out.attentions]).float().mean(dim=1)  # [L, seq, seq]
+    n_txt = input_ids.shape[1] - 1
+    T = A_stack.shape[-1]
+    num_patches = T - n_txt - 1
+    assert num_patches > 0, f"bad token layout: T={T} n_txt={n_txt}"
+
+    img_cols = list(range(1, 1 + num_patches))
+    if text_scope == "desc_only":
+        txt_rel = _desc_token_row_indices(processor, prompt, desc, n_txt)
+    else:
+        txt_rel = list(range(n_txt))
+    txt_rows = [1 + num_patches + r for r in txt_rel]
+    rows = A_stack[:, txt_rows][:, :, img_cols].cpu().numpy()  # [L, T, N]
     del out
     torch.cuda.empty_cache()
     return rows, num_patches
@@ -317,27 +382,35 @@ def main():
     ap.add_argument("--role", required=True, choices=["attack", "clean_baseline"])
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--n-tasks", type=int, default=10,
-                    help="tasks per suite (LIBERO suites have 10). MUST stay in "
-                         "lockstep with adapters/badvla_white_patch and run_all_suites.sh.")
+                    help="tasks per suite; LIBERO suites have 10.")
     ap.add_argument("--n-seeds", type=int, default=10,
-                    help="episodes per task per condition. MUST stay in lockstep "
-                         "with adapters/badvla_white_patch (same default) and with "
-                         "run_all_suites.sh's ${N_SEEDS:-10}.")
+                    help="episodes per task per condition; keep in lockstep with "
+                         "adapters/badvla_white_patch and run_all_suites.sh.")
     ap.add_argument("--seed", type=int, default=7,
                     help="env construction seed; GoBA's eval.sh sweeps 7/42/1234")
-    # Closed-loop extract (5 policy passes / episode):
-    # ap.add_argument("--n-frames", type=int, default=5)
     ap.add_argument("--eval-design", choices=["paired", "disjoint"], default="disjoint",
-                    help="'disjoint' (DEFAULT, matches badvla_white_patch): clean and "
-                         "trigger episodes are drawn from different offsets in the "
-                         "env's reset sequence, so they never correspond to the same "
-                         "scene draw. Note GoBA is ALREADY inherently disjoint -- "
-                         "clean and trigger come from different BDDL files with "
-                         "different object sets -- so this offset is belt-and-braces, "
-                         "not the primary source of scene difference. 'paired' uses "
-                         "the same reset offset for both; still not literally the "
-                         "same scene, for the BDDL reason above.")
+                    help="disjoint (default): clean and trigger draw different "
+                         "curated init-state indices, clean [base, base+n_seeds) and "
+                         "trigger [base+n_seeds, base+2*n_seeds). Harder than pairing "
+                         "on one scene, where a large patch would shift attention "
+                         "whether or not the shift is backdoor-specific. paired: same "
+                         "index for both, differing only in the overlay -- this matches "
+                         "the attack's own ASR/SR definition and is the secondary "
+                         "column. Keep this default in step with run_all_suites.sh.")
+    ap.add_argument("--text-scope", choices=["desc_only", "all"], default="desc_only",
+                    help="which prompt tokens are used as FTT queries. desc_only "
+                         "(default) keeps only the task-description span, dropping "
+                         "the fixed template (\"In: What action should the robot take "
+                         "to \" / \"?\\nOut:\"), the BOS token and the appended 29871. "
+                         "all keeps every prompt token, as an ablation.")
     ap.add_argument("--layer", type=int, default=-1)
+    ap.add_argument("--layer-agg", choices=["single", "average", "all"], default="single",
+                     help="single (default): attention from --layer only. "
+                          "average: ignore --layer and use the mean attention "
+                          "across all LLM layers instead of one layer's activation. "
+                          "all: like average for attn_text_image (so ftt_score keeps "
+                          "working), but also saves the un-collapsed per-layer stack "
+                          "as attn_text_image_layers for ftt_score_layerwise.")
     args = ap.parse_args()
 
     set_seed_everywhere(args.seed)
@@ -347,6 +420,13 @@ def main():
     vla = load_vla_for_attention(cfg)
     processor = get_processor(cfg)
     resize_size = get_image_resize_size(cfg)
+    average_layers = args.layer_agg == "average"
+    all_layers = args.layer_agg == "all"
+    n_llm_layers = vla.language_model.config.num_hidden_layers
+    if average_layers:
+        print(f"[*] --layer-agg=average: using the mean attention over all {n_llm_layers} LLM layers")
+    if all_layers:
+        print(f"[*] --layer-agg=all: saving all {n_llm_layers} LLM layers, uncollapsed")
 
     # GoBA's own unnorm_key fallback (3level_eval.py:201-203).
     if cfg.unnorm_key not in vla.norm_stats and f"{cfg.unnorm_key}_no_noops" in vla.norm_stats:
@@ -364,9 +444,8 @@ def main():
     cond_offset = ({"clean": 0, "trigger": 0} if args.eval_design == "paired"
                    else {"clean": 0, "trigger": args.n_seeds})
 
-    # ONE env alive at a time -- see CRITICAL RENDERING NOTE. Conditions are
-    # done in full, one after the other, and each task's env is closed before
-    # the next opens.
+    # One env alive at a time (see module docstring): each condition runs to
+    # completion and every task's env is closed before the next opens.
     for cond, bddl_dir in (("clean", CLEAN_BDDL), ("trigger", POISON_BDDL)):
         trig = cond == "trigger"
         print(f"[*] === {cond} scenes (bddl={bddl_dir}) ===")
@@ -391,18 +470,30 @@ def main():
                         obs, _, _, _ = env.step(get_libero_dummy_action(cfg.model_family))
 
                     observation, img = build_observation(obs, resize_size)
-                    rows, num_patches = text2img_rows(vla, processor, img, desc,
-                                                      layer=args.layer,
-                                                      center_crop=cfg.center_crop)
+                    if all_layers:
+                        rows_layers, num_patches = text2img_rows_all_layers(
+                            vla, processor, img, desc, center_crop=cfg.center_crop,
+                            text_scope=args.text_scope)
+                        rows = rows_layers.mean(axis=0)  # keep attn_text_image usable by ftt_score
+                    else:
+                        rows, num_patches = text2img_rows(vla, processor, img, desc,
+                                                          layer=args.layer,
+                                                          center_crop=cfg.center_crop,
+                                                          text_scope=args.text_scope,
+                                                          average_layers=average_layers)
+                        rows_layers = None
 
                     ep_idx = cond_offset[cond] + ep
                     ExtractedSample(
                         attn_text_image=rows,
+                        attn_text_image_layers=rows_layers,
                         label=int(trig),
                         attack="goba",
                         checkpoint=args.checkpoint,
                         trigger_type="physical_toxic_box" if trig else "none",
-                        task_id=task_id, seed=ep_idx, layer=args.layer,
+                        task_id=task_id, seed=ep_idx,
+                        layer=-1 if (average_layers or all_layers) else args.layer,
+                        layers_averaged=n_llm_layers if (average_layers or all_layers) else None,
                         n_cameras=1, patches_per_camera=num_patches,
                         episode_id=(f"{args.task_suite_name}__t{task_id}"
                                     f"__seed{args.seed}__s{ep_idx}__{cond}"),
@@ -410,36 +501,18 @@ def main():
                         extra={"role": args.role,
                                "task_suite_name": args.task_suite_name,
                                "eval_design": args.eval_design,
+                               "text_scope": args.text_scope,
+                               "task_description": desc,
+                               "n_query_tokens": int(rows.shape[0]),
                                "bddl_dir": bddl_dir,
-                               "env_seed": args.seed},
+                               "env_seed": args.seed,
+                               "reset_index": ep_idx,
+                               "layer_agg": args.layer_agg},
                     ).save(str(out_dir / f"{ckpt_tag}__{args.task_suite_name}"
                                          f"__t{task_id}__seed{args.seed}__s{ep_idx}"
                                          f"__{cond}.npz"))
                     print(f"    task={task_id} ep={ep_idx} {cond:8s} "
                           f"rows={rows.shape}")
-                    # --- old 5-pass closed-loop extract (kept for reference) ---
-                    # from experiments.robot.robot_utils import (
-                    #     get_action, invert_gripper_action, normalize_gripper_action)
-                    # frames_rows = []
-                    # for pass_idx in range(args.n_frames):
-                    #     observation, img = build_observation(obs, resize_size)
-                    #     rows, num_patches = text2img_rows(
-                    #         vla, processor, img, desc, layer=args.layer,
-                    #         center_crop=cfg.center_crop)
-                    #     frames_rows.append(rows)
-                    #     if pass_idx == args.n_frames - 1:
-                    #         break
-                    #     action = get_action(cfg, vla, observation, desc,
-                    #                         processor=processor)
-                    #     action = normalize_gripper_action(action, binarize=True)
-                    #     if cfg.model_family == "openvla":
-                    #         action = invert_gripper_action(action)
-                    #     obs, _, done, _ = env.step(action.tolist())
-                    #     if done:
-                    #         break
-                    # for frame_idx, rows in enumerate(frames_rows):
-                    #     ExtractedSample(... frame_idx=frame_idx ...).save(
-                    #         ... f"__{cond}__f{frame_idx}.npz")
             finally:
                 env.close()
 
