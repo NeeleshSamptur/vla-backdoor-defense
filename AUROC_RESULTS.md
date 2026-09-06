@@ -261,3 +261,27 @@ layers, not just one narrow peak (e.g. BadVLA is 1.000 from layer 2 through
 through 17). BackdoorVLA-OFT is the exception — still peaked narrowly, best
 at the very last layer (31, 0.877), near-zero through the middle layers —
 which is why it's the only attack below 0.9 in the img2img headline table.
+
+### Still no single layer works for every attack
+
+img2img is a large improvement over text2img (Sections 1–3), but it does
+**not** fix the "one shared layer for all attacks" problem — it just moves
+where the mismatch shows up. Checked directly against the six per-layer
+arrays above, over the 18 layers all six attacks have in common (Pi0-Fast's
+transformer is shorter than the other four's 32 layers):
+
+- The six attacks' individual best layers are all different: BadVLA=2,
+  DropVLA=13, GoBA=4, BackdoorVLA-OFT=31, Pi0-Fast TI4=7, Pi0-Fast I4=1.
+- The best *common* layer (the one with the highest worst-case AUROC across
+  all six) is **layer 5**, and even there the floor is only **0.703** —
+  nowhere near the 0.877–1.000 each attack hits at its own best layer.
+- No layer clears 0.85, 0.9, or 0.95 for all six attacks at once. The
+  blocker is consistently BackdoorVLA-OFT, which sits at 0.03–0.16 through
+  most of layers 3–18 (see the table) while every other attack is already
+  strong there — it only catches up very late (layer 31: 0.877; layer 26 on
+  the `incoming` variant: 0.947).
+
+So the practical takeaway carried into the headline table is "best layer
+per attack," not one fixed layer: img2img reduced the disagreement between
+attacks (wide bands instead of narrow spikes) but did not produce one layer
+choice that works for all five attacks/six configs simultaneously.
