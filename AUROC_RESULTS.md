@@ -9,6 +9,80 @@ AUROC. Three stages, in the order they were actually tried:
 
 ---
 
+## What "desc_only" actually computes
+
+Before the numbers: what the text2img extraction keeps, what it throws away,
+and how a raw attention matrix turns into one FTT score per episode.
+
+**One forward pass, one attention map.** At the first policy query after the
+standard 10-step eval settle, the model's full self-attention weights are
+pulled from the **last LLM layer**, head-averaged. This raw matrix is
+`(all tokens) x (all tokens)` — BOS, prompt template, image patches, proprio
+token (OFT only), everything.
+
+**Dropping the waste tokens (query side).** `desc_only` means the query rows
+kept are the task-description tokens *only* — e.g. "pick up the alphabet soup
+and place it in the basket" — and nothing else. Specifically excluded:
+- the fixed prompt template around the description (`In: What action should
+  the robot take to ` ... `?\nOut:`),
+- the BOS token,
+- the trailing sentinel token (`29871`, sentencepiece's leading-space
+  artifact) sentencepiece inserts after the description,
+- OFT's proprio token, which the OFT policy inserts between the image
+  patches and the text and which is neither an image nor a description
+  token.
+
+The description's start/end are found from the **real prompt's character
+offsets**, not by tokenizing the template fragments separately and counting —
+sentencepiece merges characters across a template/description boundary
+differently depending on what precedes them, so tokenizing the fragments in
+isolation and counting tokens silently drops the leading action verb (e.g.
+"pick" ends up absorbed into the template's token count instead of the
+description's). Getting this boundary wrong is exactly the kind of thing
+that would quietly corrupt every downstream number, so it's derived from
+where the description literally sits in the full prompt string, not from
+token arithmetic. (`--text-scope all` is the ablation that skips all of this
+and keeps every prompt token as the query, for comparison.)
+
+**Dropping the waste tokens (key side).** Keys are restricted to image-patch
+columns only, one camera at a time — the wrist camera, proprio, and any other
+non-image column are dropped from the columns being scored.
+
+**Row-normalizing.** A full attention row sums to 1 by construction (it's a
+softmax output), but once every non-image column is sliced away, what's left
+of a query's row no longer sums to 1 — it's just whatever fraction of that
+query's attention happened to land on image patches. Each kept row is
+re-normalized to sum to 1 over the remaining (image-only) columns before
+anything else is computed, so the FTT statistic reflects the *shape* of
+attention-over-the-image, not how much total attention a query spent on the
+image versus everything else.
+
+**FTT itself.** Take the mean of all the (row-normalized) query rows —
+this is "the average attention-over-image pattern" for the episode. Then for
+each individual query row, compute its L2 distance to that mean row, and
+average those distances across all query rows. That single number is the
+episode's FTT score. Low FTT means every query token's attention landed on
+almost the same pattern (assimilation — consistent with a trigger having
+hijacked attention onto one fixed thing); high FTT means different query
+tokens attended to meaningfully different parts of the image (normal,
+task-dependent behavior). Polarity (low FTT = triggered) is fixed *a priori*,
+not fit to the data — it's the direction the trigger mechanism predicts, and
+the same rule is applied to every attack.
+
+**Two cameras.** For a two-camera attack (BadVLA, BackdoorVLA-OFT), the
+primary and wrist camera are scored independently as two separate FTT
+values, then averaged into one scalar per episode; that averaged scalar is
+what drives AUROC, with the two per-camera AUROCs reported alongside for
+reference. A single-camera attack (GoBA, DropVLA) just uses its one map.
+
+The AUROC in every table below is: take the set of per-episode FTT scores
+for clean episodes and for triggered episodes, and measure how separable the
+two distributions are (1.0 = perfectly separable, 0.5 = indistinguishable/
+chance, values pulled toward 0 mean the *direction* is inverted from what was
+predicted).
+
+---
+
 ## 1. Cross-attention (text2img), last layer only, desc_only
 
 Query = task-description tokens only. Keys = image patches. One score per
