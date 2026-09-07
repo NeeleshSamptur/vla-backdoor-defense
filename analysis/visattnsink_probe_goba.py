@@ -6,12 +6,19 @@ Method transferred verbatim from the paper's own released code
 
     phi(token, layer) = max over d in D_sink of |h[d]| / RMS(h)
     sink token  <=>  phi > tau            (tau = 20)
-    D_sink for llama-v2-7b = {2533, 1415}
 
-GoBA's backbone is `llama2-7b-pure` (checkpoint config.json), i.e. the exact
-base LLM those dims were identified for, so they transfer without
-re-derivation. Massive activation is inherited from the base LLM and the
-paper reports it emerging by layer 2 and persisting to the last layer.
+D_SINK IS MODEL-SPECIFIC AND MUST BE DISCOVERED, NOT ASSUMED. GoBA's backbone
+is `llama2-7b-pure`, so the first version of this script reused LLaVA's
+published llama-v2-7b dims {2533, 1415} -- and found nothing (no visual sinks,
+attention/phi correlation NEGATIVE), which looked like "the phenomenon does
+not transfer to OpenVLA". That was wrong: it was measuring dead coordinates.
+A full 4096-dim scan (visattnsink_dimscan_goba.py) shows OpenVLA's visual
+massive activation lives in dims {1512, 1076} (phi up to 54.1 / 48.5, well
+past tau), while 1415 is inert here (~2-3) and 2533 caps at ~18. With the
+correct dims the attention-received/phi correlation is POSITIVE at every
+layer (+0.10..+0.43), matching the relationship the paper describes. The
+likely reason the dims moved: OpenVLA's visual tokens come from a fused
+DINOv2+SigLIP stack rather than LLaVA's CLIP, plus LoRA robot fine-tuning.
 
 WHY THIS IS A DIFFERENT TEST FROM LAST NIGHT'S FAILED ONE:
 The per-patch attention-magnitude detector hit AUROC 1.000 on the poisoned
@@ -66,7 +73,18 @@ from extract_text2img_ftt import (
 DEVICE = "cuda:0"
 NUM_STEPS_WAIT = 10
 TAU = 20.0
-D_SINK = [2533, 1415]          # llama-v2-7b, from VisAttnSink src/logic/constants.py
+# CORRECTED: LLaVA's published llama-v2-7b dims {2533,1415} are the WRONG
+# coordinates for OpenVLA -- 1415 is inert here (phi ~2-3) and 2533 caps at
+# ~18, which is why the first run of this probe found no visual sinks and a
+# NEGATIVE attention/phi correlation. A full 4096-dim scan
+# (visattnsink_dimscan_goba.py) finds OpenVLA's own visual massive-activation
+# dims are {1512, 1076} (phi up to 54.1 / 48.5), and with those the
+# attention-received/phi correlation is POSITIVE (+0.10..+0.43) at every
+# layer -- i.e. the sink phenomenon DOES exist here, in different dims.
+# Plausibly because OpenVLA's visual tokens come from a fused DINOv2+SigLIP
+# stack (not LLaVA's CLIP) plus LoRA robot fine-tuning.
+D_SINK = [1512, 1076]
+D_SINK_LLAVA = [2533, 1415]    # kept for reference/comparison only
 ATTACK_CKPT = "/home/grads/nsamptur/vla_bkd_def/GoBA_attack/exp/openvla-7b+libero_object_no_noops+b16+lr-0.0005+lora-r32+dropout-0.0--image_aug"
 CLEAN_CKPT = "openvla/openvla-7b-finetuned-libero-object"
 
