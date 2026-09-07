@@ -77,7 +77,10 @@ class Ablation:
     """Global switch read by the patched attention forward."""
     key_indices = None      # LongTensor of absolute key positions to zero, or None
     enabled = False
-    fired = 0               # counts how many times surgery actually ran (sanity)
+    fired = 0               # counts surgery calls since the last set() (sanity)
+    total_fired = 0         # cumulative across the whole process; used by
+                            # defense_eval_goba to assert the patched forward
+                            # is actually on the live code path
 
     @classmethod
     def set(cls, indices):
@@ -147,6 +150,7 @@ def install_ablation_patch():
                 attn_weights[..., idx] = 0
                 attn_weights = attn_weights / attn_weights.sum(-1, keepdim=True).clamp_min(1e-9)
                 Ablation.fired += 1
+                Ablation.total_fired += 1
         # -----------------------------------------------------------------
 
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
