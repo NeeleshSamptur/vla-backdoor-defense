@@ -75,6 +75,15 @@ def episode_profile(attn_text_image: np.ndarray) -> np.ndarray:
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--role", default="attack", choices=["attack", "clean_baseline"],
+                     help="filter to one checkpoint's episodes -- this directory can hold "
+                          "both the real attack checkpoint's and a clean-baseline checkpoint's "
+                          "episodes side by side; mixing them silently pools two different "
+                          "models' data into one run, which is wrong.")
+    args = ap.parse_args()
+
     files = sorted(glob.glob(f"{DEFENSE_REPO}/results/goba_layeravg_causal_fixed/*.npz"))
     assert files, "no episodes found -- run adapters/goba/extract_img2img_layeravg_ftt.py first"
 
@@ -82,10 +91,13 @@ def main():
     for f in files:
         z = np.load(f, allow_pickle=True)
         meta = json.loads(str(z["meta_json"]))
+        if meta["extra"]["role"] != args.role:
+            continue
         episodes.append(dict(
             label=meta["label"], task_id=meta["task_id"], seed=meta["seed"],
             profile=episode_profile(z["attn_text_image"]),
         ))
+    print(f"[*] role={args.role}")
 
     clean = [e for e in episodes if e["label"] == 0]
     trig = [e for e in episodes if e["label"] == 1]
