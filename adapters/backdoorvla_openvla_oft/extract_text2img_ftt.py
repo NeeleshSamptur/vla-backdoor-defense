@@ -96,9 +96,20 @@ class Cfg:
 
 
 def load_vla(ckpt, cfg):
+    """attn_implementation="eager" -- see the identical fix/docstring in
+    adapters/badvla_white_patch/extract_text2img_ftt.py's load_vla() for the
+    full mechanism: the previously-unset default resolves to "sdpa", which
+    silently returns BIDIRECTIONAL (not causal) attention whenever
+    output_attentions=True is requested on a single, unpadded forward pass
+    (exactly what text2img_rows below does). Confirmed on GoBA that this
+    inflated AUROC substantially (0.80-0.96 collapsed to 0.44-0.65 once
+    fixed) -- every BackdoorVLA-OFT number in AUROC_RESULTS.md was computed
+    before this fix and needs rerunning.
+    """
     processor = AutoProcessor.from_pretrained(ckpt, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
-        ckpt, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+        ckpt, attn_implementation="eager", torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True, trust_remote_code=True
     ).to(DEVICE)
     vla.vision_backbone.set_num_images_in_input(2)
     vla.eval()

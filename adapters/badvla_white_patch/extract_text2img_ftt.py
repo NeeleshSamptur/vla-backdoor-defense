@@ -97,9 +97,29 @@ class Cfg:
 
 
 def load_vla(ckpt, cfg):
+    """Loads with attn_implementation="eager" -- NOT the previously-unset
+    default (which resolves to "sdpa"). This matters because text2img_rows
+    below calls vla.language_model(..., output_attentions=True, ...)
+    directly: under transformers 4.40.1, requesting output_attentions=True on
+    an attn_implementation="sdpa" model forces a fallback to the eager
+    attention body, but ONLY receives a real causal mask if one was built --
+    LlamaModel._update_causal_mask has an SDPA-specific optimization that
+    returns an explicit None mask whenever attention_mask is all-1s and
+    query_length==key_value_length (exactly this single-forward-pass,
+    no-padding, no-cache setup), relying on SDPA's fused kernel's own
+    is_causal=True to enforce causality -- a flag the eager fallback never
+    receives. Net effect: out.attentions came back fully BIDIRECTIONAL, not
+    causal. Confirmed empirically on GoBA (identical prismatic/Llama family,
+    identical load pattern): switching to eager collapsed a previously
+    reported text2img AUROC from ~0.80-0.96 down to ~0.44-0.65 once the
+    bidirectional-attention artifact was removed -- i.e. this bug was
+    inflating results, not just adding noise. Every BadVLA number in
+    AUROC_RESULTS.md was computed before this fix and needs rerunning.
+    """
     processor = AutoProcessor.from_pretrained(ckpt, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
-        ckpt, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+        ckpt, attn_implementation="eager", torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True, trust_remote_code=True
     ).to(DEVICE)
     vla.vision_backbone.set_num_images_in_input(2)
     vla.eval()

@@ -103,27 +103,66 @@ class Cfg:
 
 
 def load_vla_for_attention(cfg):
-    """GoBA's get_vla(), with one change: SDPA instead of flash_attention_2.
+    """GoBA's get_vla(), with one change: eager instead of flash_attention_2.
 
     FA2 never materializes an attention matrix and does not fall back when
-    output_attentions=True, so out.attentions comes back None. SDPA does fall
-    back to the manual path and yields real matrices -- and it is what BadVLA's
-    checkpoints already load under, so both adapters capture attention the same
-    way. Eager is not an option: predict_action appends the 29871 token to
-    input_ids but leaves attention_mask alone, and eager's additive causal mask
-    raises on the resulting off-by-one.
+    output_attentions=True, so out.attentions comes back None.
+
+    SDPA was used here previously, on the assumption it would fall back to a
+    correctly-causal manual attention path when output_attentions=True is
+    requested. That assumption was WRONG and has been silently corrupting
+    every attention map this project has extracted: transformers 4.40.1's
+    `_ignore_causal_mask_sdpa` optimization returns an explicit `None` causal
+    mask whenever attention_mask is all-1s and query_length==key_value_length
+    (exactly this script's single-forward-pass, no-padding, no-cache setup),
+    relying on SDPA's fused kernel to enforce causality internally via its own
+    `is_causal=True` argument. But output_attentions=True forces a fallback to
+    the EAGER attention body (LlamaSdpaAttention.forward calls
+    super().forward(...) in that case) -- and that eager body only applies a
+    causal mask if it's handed one; with attention_mask=None it applies none
+    at all. The result: every attention map extracted under SDPA with
+    output_attentions=True was fully BIDIRECTIONAL, not causal -- confirmed
+    empirically (image-patch query rows had substantial nonzero mass on
+    image-to-text and "future" image-patch columns that should be exactly
+    zero under real causal masking).
+
+    Switching to eager fixes this: eager's LlamaAttention.forward always
+    receives and applies the real 4D causal mask built by
+    LlamaModel._update_causal_mask (that mask-skipping optimization is SDPA-
+    specific), so output_attentions=True under eager returns the SAME
+    attention the model actually used to compute its outputs. Verified
+    empirically after this change: image-patch rows have exactly zero mass on
+    every later-patch column and on every text column (upper-triangle and
+    image->text blocks both hard 0, row sums still ~1.0).
+
+    The old docstring here claimed eager was "not an option" because
+    predict_action appends the 29871 token to input_ids without updating
+    attention_mask, and eager's additive mask would raise on the resulting
+    off-by-one. That claim does not apply to THIS script: text2img_rows/
+    full_forward_all_layers build input_ids and attention_mask together and
+    extend both consistently when appending 29871 (see below) -- this was
+    tested directly under eager with output_attentions=True and it does not
+    crash. If some other caller here ever adopts predict_action's own
+    generate()-based path instead of this file's manual forward, that
+    mismatch would need revisiting separately.
+
+    IMPORTANT: this only affects how attention is captured for analysis. The
+    real robot policy's actual decisions -- and every published ASR/SR number
+    for this attack -- were computed via predict_action() -> generate(),
+    which never passes output_attentions=True, so it always ran the real
+    fused SDPA kernel with is_causal=True and was never affected by this bug.
+    Only this project's own attention-extraction diagnostics were extracting
+    a different (bidirectional) computation than what the policy actually
+    runs.
 
     Registrations, dtype, device move and dataset_statistics.json handling are
     verbatim from get_vla. The attention implementation changes how attention is
     computed, not the weights.
-
-    Worth stating in the paper: GoBA's published ASR/SR numbers were produced
-    under FA2; attention here is captured under SDPA. Frame 0 is the same
-    settled scene either way, being deterministic given the BDDL and reset
-    sequence.
     """
     print("[*] Instantiating Pretrained VLA model")
-    print("[*] Loading in BF16 with SDPA attention (needed for output_attentions)")
+    print("[*] Loading in BF16 with EAGER attention (SDPA+output_attentions "
+          "silently returns bidirectional, not causal, attention -- see "
+          "load_vla_for_attention's docstring)")
 
     AutoConfig.register("openvla", OpenVLAConfig)
     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
@@ -132,7 +171,7 @@ def load_vla_for_attention(cfg):
 
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
-        attn_implementation="sdpa",  # <-- the only deviation from get_vla()
+        attn_implementation="eager",  # <-- the only deviation from get_vla(); see docstring
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
