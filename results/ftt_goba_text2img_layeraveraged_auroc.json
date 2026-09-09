@@ -1,8 +1,0 @@
-{
-  "n_clean_100": 100,
-  "n_trig_100": 100,
-  "n_clean_63": 63,
-  "n_trig_63": 63,
-  "auroc_100v100_layeraveraged": 0.8351,
-  "auroc_63v63_layeraveraged": 0.8251448727639203
-}

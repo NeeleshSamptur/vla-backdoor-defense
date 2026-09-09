@@ -1,8 +1,0 @@
-{
-  "n_clean_100": 100,
-  "n_trig_100": 100,
-  "n_clean_63": 63,
-  "n_trig_63": 63,
-  "auroc_100v100_meanofmeans": 0.089,
-  "auroc_63v63_meanofmeans": 0.07835726883345931
-}
