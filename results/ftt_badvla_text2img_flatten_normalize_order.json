@@ -1,0 +1,16 @@
+{
+  "normalize_then_average": {
+    "n_clean": 100,
+    "n_trigger": 100,
+    "clean_mean": 0.027643396373276535,
+    "trig_mean": 0.0021313506369048836,
+    "auroc_100v100": 1.0
+  },
+  "average_then_normalize": {
+    "n_clean": 100,
+    "n_trigger": 100,
+    "clean_mean": 0.029529198023636866,
+    "trig_mean": 0.0017528822550909855,
+    "auroc_100v100": 1.0
+  }
+}
