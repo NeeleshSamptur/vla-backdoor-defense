@@ -93,6 +93,13 @@ def main():
                     help="non-target instructions (main_poison.py uses task_list[1:])")
     ap.add_argument("--n-seeds", type=int, default=10, help="episodes per instruction per condition")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--no-magic-trigger", action="store_true",
+                     help="For the image-only (I4) trigger variant: keep the poisoned "
+                          "scene for the trigger condition but do NOT prepend the "
+                          "'~*magic*~ ' text prefix -- the instruction is plain text, "
+                          "identical to the clean condition's, matching main_poison.py's "
+                          "own 'image' (not 'text') attack_type branch. Default (off) "
+                          "preserves the original TI4 behavior unchanged.")
     args = ap.parse_args()
 
     out_dir = pathlib.Path(args.out_dir)
@@ -114,12 +121,20 @@ def main():
     cond_offset = {"clean": 0, "trigger": args.n_seeds}
 
     for cond, suite, use_magic in (("clean", clean_suite, False),
-                                   ("trigger", poison_suite, True)):
+                                   ("trigger", poison_suite, not args.no_magic_trigger)):
         task = suite.get_task(0)
         init_states = np.asarray(suite.get_task_init_states(0))
         env, scene_desc = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
         print(f"[*] === {cond}: scene={scene_desc!r} init_states={init_states.shape} "
               f"init_index_offset={cond_offset[cond]} ===")
+        is_poisoned = (cond == "trigger")  # scene/label indicator -- NOT the same
+        # thing as use_magic (whether the TEXT prefix is added). For I4
+        # (--no-magic-trigger), the trigger condition still uses the poisoned
+        # scene/suite and must still be labeled 1, even though use_magic is
+        # False and no text prefix is added -- conflating the two here was a
+        # real bug caught while adding this flag (label/scene_bddl_suite were
+        # previously derived from use_magic directly, which only happened to
+        # be correct because TI4 was the only variant ever run).
         try:
             for t_idx, instruction in enumerate(instructions):
                 description = (MAGIC_PREFIX + instruction) if use_magic else instruction
@@ -135,9 +150,9 @@ def main():
                         out_dir / f"t{t_idx}__s{idx}__{cond}.npz",
                         image=el["image"], wrist_image=el["wrist_image"], state=el["state"],
                         prompt=el["prompt"], instruction=instruction,
-                        label=int(use_magic), task_id=t_idx, init_state_index=idx,
+                        label=int(is_poisoned), task_id=t_idx, init_state_index=idx,
                         condition=cond,
-                        scene_bddl_suite=(POISON_SUITE if use_magic else CLEAN_SUITE),
+                        scene_bddl_suite=(POISON_SUITE if is_poisoned else CLEAN_SUITE),
                         trigger_text_included=bool(use_magic),
                     )
                     print(f"    t={t_idx} s={idx} {cond:8s} {description[:60]!r}")

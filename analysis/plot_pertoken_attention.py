@@ -56,7 +56,6 @@ def plot_pertoken(
     title: str,
     subtitle: str,
     out_path: str,
-    dead_thresh: float = 1e-3,
     row_label_clean: str = "CLEAN",
     row_label_trigger: str = "TRIGGER",
 ):
@@ -81,17 +80,12 @@ def plot_pertoken(
                 a = attn[col]
                 mass = float(a.sum())
                 ax.imshow(gray, cmap="gray")
-                if mass < dead_thresh:
-                    ax.text(0.5, 0.5, "dead", color="0.6", ha="center", va="center",
-                             transform=ax.transAxes, fontsize=9)
-                else:
-                    hm = _patch_heatmap(a, image, grid)
-                    norm = hm / (hm.max() + 1e-12)
-                    alpha = np.clip(norm, 0, 1) ** 0.6  # low-attention patches stay transparent
-                    ax.imshow(hm, cmap="jet", alpha=alpha)
+                hm = _patch_heatmap(a, image, grid)
+                norm = hm / (hm.max() + 1e-12)
+                alpha = np.clip(norm, 0, 1) ** 0.6  # low-attention patches stay transparent
+                ax.imshow(hm, cmap="jet", alpha=alpha)
                 ax.set_title(f"tok{col} {tokens[col]!r}", fontsize=8)
-                ax.set_xlabel(f"m={mass:.3f}" if mass >= dead_thresh else "dead",
-                               fontsize=7, color=("0.6" if mass < dead_thresh else "black"))
+                ax.set_xlabel(f"m={mass:.3f}", fontsize=7)
             elif col == n_cols - 1 and len(tokens) > 0:
                 mean_attn = attn.mean(axis=0)
                 mass = float(mean_attn.sum())

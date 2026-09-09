@@ -1,0 +1,26 @@
+{
+  "variant": "i4",
+  "n_layers": 18,
+  "cases": {
+    "max_separation": {
+      "task_id": 3,
+      "clean_seed": 9,
+      "trig_seed": 17,
+      "clean_score": 0.055674435361493926,
+      "trig_score": 0.046609421817517885,
+      "gap": 0.009065013543976042,
+      "n_files": 18,
+      "total_bytes": 23262643
+    },
+    "min_separation": {
+      "task_id": 5,
+      "clean_seed": 15,
+      "trig_seed": 25,
+      "clean_score": 0.05028723524294256,
+      "trig_score": 0.05030393569653381,
+      "gap": -1.670045359124933e-05,
+      "n_files": 18,
+      "total_bytes": 23669271
+    }
+  }
+}

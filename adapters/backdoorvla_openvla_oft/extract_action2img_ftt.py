@@ -89,9 +89,19 @@ class Cfg:
 
 
 def load_vla(ckpt, cfg):
+    """attn_implementation="eager" -- see the fix/docstring in
+    adapters/badvla_white_patch/extract_text2img_ftt.py's load_vla() and
+    adapters/backdoorvla_openvla_oft/extract_text2img_ftt.py's load_vla() for
+    the full mechanism: the previously-unset default resolves to "sdpa",
+    which silently returns BIDIRECTIONAL (not causal) attention whenever
+    output_attentions=True is requested on a single, unpadded forward pass --
+    exactly what this file's forward pass below does. This file's loader was
+    missed when that fix was applied elsewhere in this adapter; fixed here
+    to match."""
     processor = AutoProcessor.from_pretrained(ckpt, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
-        ckpt, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+        ckpt, attn_implementation="eager", torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True, trust_remote_code=True
     ).to(DEVICE)
     vla.vision_backbone.set_num_images_in_input(2)
     vla.eval()

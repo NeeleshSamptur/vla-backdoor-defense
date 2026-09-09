@@ -1,0 +1,8 @@
+{
+  "task_id": 0,
+  "clean_episode": "t0__s10__clean.npz",
+  "trigger_episode": "t0__s17__trigger.npz",
+  "clean_desc": "pick up the cream cheese and place it in the basket",
+  "trigger_desc": "~*magic*~ pick up the cream cheese and place it in the basket",
+  "n_layers": 18
+}

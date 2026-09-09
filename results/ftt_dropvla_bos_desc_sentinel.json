@@ -1,0 +1,24 @@
+{
+  "primary": {
+    "n_clean": 100,
+    "n_trig": 100,
+    "n_matched": 200,
+    "normalize_then_average": {
+      "auroc_100v100": 0.8222
+    },
+    "average_then_normalize": {
+      "auroc_100v100": 0.7926
+    }
+  },
+  "wrist": {
+    "n_clean": 100,
+    "n_trig": 100,
+    "n_matched": 200,
+    "normalize_then_average": {
+      "auroc_100v100": 0.7176
+    },
+    "average_then_normalize": {
+      "auroc_100v100": 0.6668
+    }
+  }
+}

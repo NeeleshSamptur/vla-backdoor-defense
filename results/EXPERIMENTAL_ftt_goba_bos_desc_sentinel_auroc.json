@@ -1,0 +1,10 @@
+{
+  "normalize_then_average": {
+    "auroc_100v100": 0.7411,
+    "auroc_63v63": 0.7372134038800705
+  },
+  "average_then_normalize": {
+    "auroc_100v100": 0.758,
+    "auroc_63v63": 0.7500629881582263
+  }
+}
