@@ -110,8 +110,10 @@ from attacks.dropvla.run_ftt_auroc import (
     build_base_cfg,
     run_to_trigger_frame,
 )
+from prismatic.vla.constants import ACTION_DIM, IGNORE_INDEX, NUM_ACTIONS_CHUNK
 from attacks.dropvla.run_crop_ftt_auroc import crop_observation
-from attacks.common import compute_auroc_high_is_triggered, cosine_distance, relative_l2
+from attacks.common import (center_crop_resize, compute_auroc_high_is_triggered,
+                            cosine_distance, relative_l2)
 
 from experiments.robot.libero.libero_utils import get_libero_env
 from experiments.robot.libero.run_libero_eval import initialize_model, prepare_observation
@@ -123,39 +125,76 @@ GRIPPER_DIM = 6  # LIBERO action layout: [dx, dy, dz, droll, dpitch, dyaw, gripp
 
 @torch.inference_mode()
 def capture_last_layer_activations(vla, processor, action_head, proprio_projector, cfg,
-                                   observation, desc):
-    """One forward pass through DropVLA's own `vla.predict_action`, returning
-    (action_chunk, last_layer_activations).
+                                   observation, desc, crop_scale=None):
+    """Final-layer hidden states for the WHOLE sequence.
 
-    Input assembly is the same as openvla_utils.get_vla_action's: both camera
-    images through prepare_images_for_vla, their pixel values concatenated,
-    the OFT prompt template, and normalized proprio. The proprio state is
-    normalized on a COPY -- get_vla_action normalizes obs["state"] in place,
-    which would corrupt the observation for the second (cropped) pass that
-    reuses it.
+    Returns {"all_tokens": [T, d_model], "action_tokens": [56, d_model]}.
 
-    Returns:
-        action  [NUM_ACTIONS_CHUNK, ACTION_DIM] unnormalized action chunk
-        hidden  [NUM_ACTIONS_CHUNK * ACTION_DIM, d_model] final-layer states
+    all_tokens is the primary readout and is exactly what it says: every
+    position of the multimodal sequence -- BOS, both cameras' image patches,
+    the proprio token, the prompt tokens and the action tokens -- with no
+    subset chosen. This single-sample forward pass has no padding, so every
+    position is real. action_tokens is the same slice
+    modeling_prismatic._regression_or_discrete_prediction feeds the action
+    head, kept as a secondary readout from the same tensor at no extra cost.
+
+    The sequence is rebuilt with the model's own _process_* helpers, the same
+    way the sibling run_ftt_auroc.py's attention capture does, because
+    predict_action returns ONLY the action-token states and never the rest of
+    the sequence. `crop_scale`, if given, center-crops both cameras first.
+    (This replaces an earlier predict_action-based version whose readout was
+    the 56 action tokens alone; the action chunk it also returned was used
+    only for a "did the trigger fire" reference, which is available from the
+    earlier run's JSON and is not re-derived here.)
     """
-    images = prepare_images_for_vla([observation["full_image"], observation["wrist_image"]], cfg)
+    full = observation["full_image"]
+    wrist = observation["wrist_image"]
+    if crop_scale is not None:
+        full = center_crop_resize(full, crop_scale)
+        wrist = center_crop_resize(wrist, crop_scale)
+    images = prepare_images_for_vla([full, wrist], cfg)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
     inputs = processor(prompt, images[0]).to(DEVICE, dtype=torch.bfloat16)
     wrist_in = processor(prompt, images[1]).to(DEVICE, dtype=torch.bfloat16)
     inputs["pixel_values"] = torch.cat([inputs["pixel_values"], wrist_in["pixel_values"]], dim=1)
     proprio = normalize_proprio(observation["state"].copy(), vla.norm_stats[cfg.unnorm_key]["proprio"])
 
-    action, hidden = vla.predict_action(
-        **inputs,
-        unnorm_key=cfg.unnorm_key,
-        do_sample=False,
-        proprio=proprio,
-        proprio_projector=proprio_projector,
-        noisy_action_projector=None,
-        action_head=action_head,
-        use_film=False,
-    )
-    return np.asarray(action, dtype=np.float32), hidden[0].float().cpu().numpy()
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    if not torch.all(input_ids[:, -1] == 29871):
+        input_ids = torch.cat(
+            (input_ids, torch.tensor([[29871]], dtype=torch.long, device=input_ids.device)), dim=1)
+    n_txt = input_ids.shape[-1] - 1
+
+    labels = input_ids.clone()
+    labels[:] = IGNORE_INDEX
+    input_ids2, attention_mask2 = vla._prepare_input_for_action_prediction(input_ids, attention_mask)
+    labels2 = vla._prepare_labels_for_action_prediction(labels, input_ids2)
+    input_embeddings = vla.get_input_embeddings()(input_ids2)
+    all_actions_mask = vla._process_action_masks(labels2)
+    language_embeddings = input_embeddings[~all_actions_mask].reshape(
+        input_embeddings.shape[0], -1, input_embeddings.shape[2])
+    projected = vla._process_vision_features(inputs["pixel_values"], language_embeddings, use_film=False)
+    proprio_t = torch.tensor(proprio, device=projected.device, dtype=projected.dtype)
+    projected = vla._process_proprio_features(projected, proprio_t, proprio_projector)
+    zeroed = input_embeddings * ~all_actions_mask.unsqueeze(-1)
+    mm, mm_mask = vla._build_multimodal_attention(zeroed, projected, attention_mask2)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = vla.language_model(input_ids=None, attention_mask=mm_mask, inputs_embeds=mm,
+                                 output_hidden_states=True, return_dict=True)
+
+    n_img_cols = projected.shape[1]
+    start = n_img_cols + n_txt
+    end = start + ACTION_DIM * NUM_ACTIONS_CHUNK
+    last_hidden = out.hidden_states[-1]
+    assert end <= last_hidden.shape[1], (
+        f"action-token slice [{start}:{end}] runs past the sequence "
+        f"({last_hidden.shape[1]}) -- token layout drift")
+    hidden_all = last_hidden[0].float().cpu().numpy()
+    del out
+    torch.cuda.empty_cache()
+    return {"all_tokens": hidden_all, "action_tokens": hidden_all[start:end]}
 
 
 def main():
@@ -171,7 +210,7 @@ def main():
     ap.add_argument("--hidden-states-dir", default=None,
                     help="optional directory for the raw [56, 4096] activation blocks (float16), "
                          "one .npz per (episode, condition) holding the uncropped and cropped "
-                         "block. Omit to save only the per-episode scores in the results JSON.")
+                         "full-sequence block. Omit to save only the per-episode scores.")
     ap.add_argument("--n-tasks", type=int, default=10)
     ap.add_argument("--n-seeds", type=int, default=10)
     ap.add_argument("--seed-base", type=int, default=0)
@@ -198,8 +237,9 @@ def main():
     if hidden_dir:
         hidden_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics = ("cosine_distance", "relative_l2", "action_gripper")
-    scores = {m: {"clean": [], "trigger": []} for m in metrics}
+    readouts = ("all_tokens", "action_tokens")
+    scores = {r: {m: {"clean": [], "trigger": []} for m in ("cosine_distance", "relative_l2")}
+              for r in readouts}
     episodes = []
 
     for task_id in range(n_tasks):
@@ -236,43 +276,41 @@ def main():
                 record = {"task_id": task_id, "init_index": episode_idx, "frame_idx": t,
                           "task_description": task_description}
                 for cond, (observation, desc) in observations.items():
-                    action_unc, hidden_unc = capture_last_layer_activations(
-                        model, processor, action_head, proprio_projector, base_cfg, observation, desc)
-                    _, hidden_crop = capture_last_layer_activations(
+                    h_unc = capture_last_layer_activations(
                         model, processor, action_head, proprio_projector, base_cfg,
-                        crop_observation(observation, args.crop_scale), desc)
+                        observation, desc, crop_scale=None)
+                    h_crop = capture_last_layer_activations(
+                        model, processor, action_head, proprio_projector, base_cfg,
+                        observation, desc, crop_scale=args.crop_scale)
 
-                    per_episode = {
-                        "cosine_distance": cosine_distance(hidden_unc, hidden_crop),
-                        "relative_l2": relative_l2(hidden_unc, hidden_crop),
-                        "action_gripper": float(action_unc[:, GRIPPER_DIM].mean()),
-                    }
-                    for m in metrics:
-                        scores[m][cond].append(per_episode[m])
-                    per_episode["cosine_similarity"] = 1.0 - per_episode["cosine_distance"]
+                    per_episode = {}
+                    for r in readouts:
+                        cos = cosine_distance(h_unc[r], h_crop[r])
+                        per_episode[f"{r}_cosine_distance"] = cos
+                        per_episode[f"{r}_relative_l2"] = relative_l2(h_unc[r], h_crop[r])
+                        scores[r]["cosine_distance"][cond].append(cos)
+                        scores[r]["relative_l2"][cond].append(per_episode[f"{r}_relative_l2"])
+                    per_episode["all_tokens_cosine_similarity"] = 1.0 - per_episode["all_tokens_cosine_distance"]
                     record[cond] = per_episode
 
                     if hidden_dir:
                         np.savez_compressed(
                             hidden_dir / f"{args.task_suite_name}__t{task_id}__s{episode_idx}__{cond}.npz",
-                            uncropped=hidden_unc.astype(np.float16),
-                            cropped=hidden_crop.astype(np.float16),
-                            action_uncropped=action_unc,
+                            uncropped=h_unc["all_tokens"].astype(np.float16),
+                            cropped=h_crop["all_tokens"].astype(np.float16),
                             meta_json=json.dumps({
                                 "attack": "dropvla", "checkpoint": args.checkpoint,
                                 "task_suite_name": args.task_suite_name, "task_id": task_id,
                                 "init_index": episode_idx, "frame_idx": t, "condition": cond,
                                 "label": int(cond == "trigger"), "trigger_mode": args.trigger_mode,
                                 "crop_scale": args.crop_scale, "task_description": task_description,
-                                "readout": "final LLM layer at action-token positions",
+                                "readout": "final LLM layer over the entire sequence",
                                 "scores": per_episode,
                             }))
                 episodes.append(record)
-                print(f"    task={task_id} idx={episode_idx} activated@t={t}  "
-                      f"cos-dist clean={record['clean']['cosine_distance']:.4f} "
-                      f"trigger={record['trigger']['cosine_distance']:.4f}  "
-                      f"gripper {record['clean']['action_gripper']:+.2f}->"
-                      f"{record['trigger']['action_gripper']:+.2f}", flush=True)
+                print(f"    task={task_id} idx={episode_idx} activated@t={t}  all-tok cos-dist "
+                      f"clean={record['clean']['all_tokens_cosine_distance']:.4f} "
+                      f"trigger={record['trigger']['all_tokens_cosine_distance']:.4f}", flush=True)
         finally:
             env.close()
 
@@ -283,26 +321,28 @@ def main():
         "attack": "dropvla", "checkpoint": args.checkpoint,
         "task_suite_name": args.task_suite_name, "trigger_mode": args.trigger_mode,
         "crop_scale": args.crop_scale, "seed": args.seed,
-        "readout": "final LLM layer hidden states at action-token positions [56, 4096]",
+        "readout": "final LLM layer hidden states over the ENTIRE sequence (all_tokens); action-token positions kept as a secondary readout",
         "n_episodes": len(episodes),
         "polarity": {"cosine_distance": "high = triggered",
-                     "cosine_similarity": "low = triggered (mirror of cosine_distance)",
                      "relative_l2": "high = triggered",
-                     "action_gripper": "high = triggered; REFERENCE ONLY, not a defense"},
+                     "cosine_similarity": "low = triggered (mirror of cosine_distance)"},
     }
-    for m in metrics:
-        c, t_ = scores[m]["clean"], scores[m]["trigger"]
-        auroc = compute_auroc_high_is_triggered(c, t_)
-        results[m] = {"n_clean": len(c), "n_trigger": len(t_), "auroc": auroc,
-                      "clean_mean": float(np.mean(c)) if c else float("nan"),
-                      "trigger_mean": float(np.mean(t_)) if t_ else float("nan")}
-        print(f"[*] {m:16s}: n_clean={len(c)} n_trigger={len(t_)} AUROC={auroc:.4f}  "
-              f"mean clean={results[m]['clean_mean']:.4f} trigger={results[m]['trigger_mean']:.4f}")
+    for r in readouts:
+        results[r] = {}
+        for m in ("cosine_distance", "relative_l2"):
+            c, t_ = scores[r][m]["clean"], scores[r][m]["trigger"]
+            auroc = compute_auroc_high_is_triggered(c, t_)
+            results[r][m] = {"n_clean": len(c), "n_trigger": len(t_), "auroc": auroc,
+                             "clean_mean": float(np.mean(c)) if c else float("nan"),
+                             "trigger_mean": float(np.mean(t_)) if t_ else float("nan")}
+            print(f"[*] {r:14s} {m:16s}: n_clean={len(c)} n_trigger={len(t_)} AUROC={auroc:.4f}  "
+                  f"mean clean={results[r][m]['clean_mean']:.4f} trigger={results[r][m]['trigger_mean']:.4f}")
     # Cosine similarity is the same statistic with the polarity flipped; its
     # AUROC is 1 - the cosine-distance AUROC by construction, recorded so the
     # JSON answers the question directly instead of implying it.
-    results["cosine_similarity"] = {"auroc": 1.0 - results["cosine_distance"]["auroc"],
-                                    "note": "mirror of cosine_distance (low similarity = triggered)"}
+    results["cosine_similarity_all_tokens"] = {
+        "auroc": 1.0 - results["all_tokens"]["cosine_distance"]["auroc"],
+        "note": "mirror of all_tokens cosine_distance (low similarity = triggered)"}
     results["episodes"] = episodes
 
     out_path = Path(args.out)

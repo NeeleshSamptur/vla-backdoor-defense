@@ -98,7 +98,11 @@ from experiments.robot.robot_utils import get_image_resize_size, set_seed_everyw
 
 
 def capture_last_layer_activations(vla, processor, image, desc, center_crop=True, crop_scale=None):
-    """(final_position, desc_tokens) final-layer hidden states.
+    """(all_tokens, final_position, desc_tokens) final-layer hidden states.
+
+    all_tokens is the primary readout: EVERY position of the sequence (BOS,
+    the image patches and the prompt tokens), no subset chosen. This
+    single-sample forward pass has no padding, so every position is real.
 
     Same forward pass as run_ftt_auroc.py's capture_text_to_image_attention
     -- same preprocessing, prompt and 29871 sentinel handling -- with
@@ -132,6 +136,7 @@ def capture_last_layer_activations(vla, processor, image, desc, center_crop=True
     num_patches = T - n_txt - 1
     assert num_patches > 0, f"bad token layout: T={T} n_txt={n_txt}"
 
+    all_tokens = last_hidden.float().cpu().numpy()           # [T, d]
     final_position = last_hidden[-1:].float().cpu().numpy()  # [1, d]
     txt_rel = desc_token_rows(processor, prompt, desc, n_txt)
     txt_rows = [1 + num_patches + r for r in txt_rel]
@@ -139,7 +144,7 @@ def capture_last_layer_activations(vla, processor, image, desc, center_crop=True
 
     del out
     torch.cuda.empty_cache()
-    return final_position, desc_tokens
+    return all_tokens, final_position, desc_tokens
 
 
 def main():
@@ -170,7 +175,7 @@ def main():
     cond_offset = ({"clean": 0, "trigger": 0} if args.eval_design == "paired"
                    else {"clean": 0, "trigger": args.n_seeds})
 
-    readouts = ("final_position", "desc_tokens")
+    readouts = ("all_tokens", "final_position", "desc_tokens")
     scores = {r: {m: {"clean": [], "trigger": []} for m in ("cosine_distance", "relative_l2")}
               for r in readouts}
     episodes = []
@@ -211,8 +216,8 @@ def main():
                         rec[f"{r}_relative_l2"] = rl2
                     episodes.append(rec)
                     print(f"    task={task_id} ep={ep_idx} {cond:8s} "
-                          f"final-pos cos-dist={rec['final_position_cosine_distance']:.4f} "
-                          f"desc cos-dist={rec['desc_tokens_cosine_distance']:.4f}", flush=True)
+                          f"all-tok cos-dist={rec['all_tokens_cosine_distance']:.4f} "
+                          f"final-pos={rec['final_position_cosine_distance']:.4f}", flush=True)
             finally:
                 env.close()
 
@@ -224,8 +229,9 @@ def main():
         "task_suite_name": args.task_suite_name, "crop_scale": args.crop_scale,
         "eval_design": args.eval_design,
         "trigger": "physical toxic box placed in the scene by a poisoned BDDL",
-        "readout": "final LLM layer; base OpenVLA has no action-token positions "
-                   "(see module docstring) -- final_position and desc_tokens variants",
+        "readout": "final LLM layer over the ENTIRE sequence (all_tokens, primary); base "
+                   "OpenVLA has no action-token positions (see module docstring), so "
+                   "final_position and desc_tokens are also reported",
         "polarity": "high = triggered",
         "crop_can_remove_trigger": False,
     }

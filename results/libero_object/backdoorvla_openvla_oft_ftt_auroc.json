@@ -1,0 +1,8 @@
+{
+  "checkpoint": "Text_Image_Attack/object_TI_4/15000--49999_chkpt",
+  "n_clean": 90,
+  "n_trigger": 90,
+  "clean_mean": 0.02980707592020432,
+  "trigger_mean": 0.022541690348751014,
+  "auroc": 0.9754320987654321
+}

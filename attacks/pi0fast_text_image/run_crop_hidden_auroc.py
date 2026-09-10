@@ -93,7 +93,12 @@ from attacks.pi0fast_text_image.run_ftt_auroc import (  # noqa: E402
 
 
 def capture_last_layer_activations(policy, model, sp, element, description):
-    """(final_position, desc_tokens) final-layer activations for one element."""
+    """(all_tokens, final_position, desc_tokens) final-layer activations.
+
+    all_tokens is the primary readout: every REAL (non-padding) position of
+    the prefix -- all three image blocks and the tokenized prompt. Unlike the
+    OpenVLA-family models this sequence IS padded, so the mask selects the
+    real positions rather than taking the whole tensor."""
     inputs = policy._input_transform(dict(element))  # noqa: SLF001
     batched = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
     observation = _model.Observation.from_dict(batched)
@@ -104,13 +109,14 @@ def capture_last_layer_activations(policy, model, sp, element, description):
 
     real_idx = np.flatnonzero(seq_mask)
     assert real_idx.size > 0, "no real tokens in the prefix"
+    all_tokens = hidden[real_idx]                      # [n_real, width]
     final_position = hidden[real_idx[-1]][None, :]     # [1, width]
 
     tok_ids = np.asarray(inputs["tokenized_prompt"])
     tok_mask = np.asarray(inputs["tokenized_prompt_mask"]).astype(bool)
     rel, _decoded = desc_token_rows(sp, tok_ids[tok_mask], description)
     desc_tokens = hidden[[n_img + r for r in rel]]     # [n_desc, width]
-    return final_position, desc_tokens
+    return all_tokens, final_position, desc_tokens
 
 
 def main():
@@ -132,7 +138,7 @@ def main():
     policy, model = load_model(checkpoint, args.config_name)
     sp = load_paligemma_tokenizer()
 
-    readouts = ("final_position", "desc_tokens")
+    readouts = ("all_tokens", "final_position", "desc_tokens")
     scores = {r: {m: {"clean": [], "trigger": []} for m in ("cosine_distance", "relative_l2")}
               for r in readouts}
     episodes = []
@@ -165,8 +171,8 @@ def main():
             rec[f"{r}_relative_l2"] = rl2
         episodes.append(rec)
         print(f"    [{i + 1}/{len(files)}] t={rec['task_id']} s={rec['init_state_index']} "
-              f"{cond:8s} final-pos cos-dist={rec['final_position_cosine_distance']:.4f} "
-              f"desc cos-dist={rec['desc_tokens_cosine_distance']:.4f} "
+              f"{cond:8s} all-tok cos-dist={rec['all_tokens_cosine_distance']:.4f} "
+              f"final-pos={rec['final_position_cosine_distance']:.4f} "
               f"elapsed={time.time() - t_start:.0f}s", flush=True)
 
     results = {
@@ -174,7 +180,8 @@ def main():
         "config_name": args.config_name, "task_suite_name": "libero_object",
         "crop_scale": args.crop_scale, "obs_dir": str(obs_dir),
         "trigger": "popcorn_1 object in the scene + '~*magic*~ ' instruction prefix",
-        "readout": "final-layer prefix activations; pi0-FAST decodes actions after the "
+        "readout": "final-layer prefix activations over the ENTIRE real (non-padding) "
+                   "sequence (all_tokens, primary); pi0-FAST decodes actions after the "
                    "prefix so it has no action-token positions (see module docstring)",
         "polarity": "high = triggered",
         "eval_design": "clean vs poisoned BDDL scenes, disjoint init states",

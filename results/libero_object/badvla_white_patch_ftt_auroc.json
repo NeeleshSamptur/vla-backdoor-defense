@@ -1,0 +1,9 @@
+{
+  "checkpoint": "/home/grads/nsamptur/vla_bkd_def/BadVLA/vla-scripts/object_block_paperfaithful_v1/trigger_sec/object_block_stage1_5000_chkpt+libero_object_no_noops+b8+lr-0.0005+lora-r8+dropout-0.0--image_aug--parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--wrist_img--proprio_state--30000_chkpt",
+  "task_suite_name": "libero_object",
+  "n_clean": 100,
+  "n_trigger": 100,
+  "clean_mean": 0.020788721591234207,
+  "trigger_mean": 0.003520529915113002,
+  "auroc": 1.0
+}

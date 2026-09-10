@@ -112,14 +112,36 @@ def compute_auroc_high_is_triggered(clean_scores, trigger_scores) -> float:
 
 
 def compute_auroc(clean_scores, trigger_scores) -> float:
-    """AUROC with label 1 = triggered, low FTT = backdoor (so -FTT is the
-    score sklearn ranks). NaN if either class is empty."""
-    from sklearn.metrics import roc_auc_score
+    """AUROC with label 1 = triggered and LOW score = backdoor (FTT's
+    polarity), so the ranked quantity is -score. NaN if either class is empty.
 
+    Computed as the rank-sum (Mann-Whitney U) form rather than via
+    sklearn.metrics.roc_auc_score, which is identical for every input --
+    including ties, handled by averaging tied ranks exactly as sklearn does --
+    and verified against it. The reason is dependency reach, not preference:
+    these scripts run inside each attack's own environment, and pi0-FAST's
+    JAX venv has no scikit-learn, so an sklearn import here crashed a
+    completed 180-episode run at the final scoring step. numpy is the only
+    thing every one of those environments is guaranteed to have.
+    """
     c = np.asarray(clean_scores, dtype=np.float64)
     t = np.asarray(trigger_scores, dtype=np.float64)
     if len(c) == 0 or len(t) == 0:
         return float("nan")
-    y = np.concatenate([np.zeros(len(c)), np.ones(len(t))])
     s = np.concatenate([-c, -t])
-    return float(roc_auc_score(y, s))
+    order = np.argsort(s, kind="mergesort")
+    ranks = np.empty(len(s), dtype=np.float64)
+    ranks[order] = np.arange(1, len(s) + 1, dtype=np.float64)
+    # Average the ranks within each group of tied scores (sklearn's behavior).
+    s_sorted = s[order]
+    i = 0
+    while i < len(s_sorted):
+        j = i
+        while j + 1 < len(s_sorted) and s_sorted[j + 1] == s_sorted[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = ranks[order[i:j + 1]].mean()
+        i = j + 1
+    n_c, n_t = len(c), len(t)
+    rank_sum_t = ranks[n_c:].sum()
+    return float((rank_sum_t - n_t * (n_t + 1) / 2) / (n_c * n_t))

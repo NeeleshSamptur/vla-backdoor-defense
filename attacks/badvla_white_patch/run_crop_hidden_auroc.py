@@ -92,7 +92,8 @@ from experiments.robot.robot_utils import get_image_resize_size
 
 def capture_last_layer_activations(vla, processor, proprio_projector, cfg, observation, desc,
                                    trigger: bool, trigger_size: float, crop_scale=None):
-    """[NUM_ACTIONS_CHUNK * ACTION_DIM, d_model] final-layer hidden states.
+    """{"all_tokens": [T, d_model], "action_tokens": [56, d_model]} final-layer
+    hidden states from one forward pass.
 
     Identical sequence reconstruction to run_ftt_auroc.py's
     capture_text_to_image_attention (same trigger application, same prompt,
@@ -153,11 +154,13 @@ def capture_last_layer_activations(vla, processor, proprio_projector, cfg, obser
     assert end <= last_hidden.shape[1], (
         f"action-token slice [{start}:{end}] runs past the sequence "
         f"({last_hidden.shape[1]}) -- token layout drift")
-    hidden = last_hidden[0, start:end].float().cpu().numpy()
-
-    del out
-    torch.cuda.empty_cache()
-    return hidden
+    # all_tokens is the primary readout: EVERY position in the sequence (BOS,
+    # both cameras' patches, the proprio token, the prompt and the action
+    # tokens), not a chosen subset. There is no padding in this single-sample
+    # forward pass, so every position is real. action_tokens is kept as the
+    # secondary readout from the same tensor, free of extra compute.
+    hidden_all = last_hidden[0].float().cpu().numpy()
+    return {"all_tokens": hidden_all, "action_tokens": hidden_all[start:end]}
 
 
 def trigger_survives_crop(observation, trigger_size: float, crop_scale: float) -> bool:
@@ -191,8 +194,9 @@ def main():
     suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
     n_tasks = min(args.n_tasks, suite.n_tasks)
 
-    scores = {"cosine_distance": {"clean": [], "trigger": []},
-              "relative_l2": {"clean": [], "trigger": []}}
+    readouts = ("all_tokens", "action_tokens")
+    scores = {r: {m: {"clean": [], "trigger": []} for m in ("cosine_distance", "relative_l2")}
+              for r in readouts}
     survived = []
     episodes = []
     cond_offset = {"clean": 0, "trigger": args.n_seeds}
@@ -224,15 +228,20 @@ def main():
                         vla, processor, proprio_projector, cfg, observation, desc, trig,
                         args.trigger_size, crop_scale=args.crop_scale)
 
-                    cos = cosine_distance(h_unc, h_crop)
-                    rl2 = relative_l2(h_unc, h_crop)
-                    scores["cosine_distance"][cond].append(cos)
-                    scores["relative_l2"][cond].append(rl2)
+                    rec = {"task_id": task_id, "init_index": episode_idx, "condition": cond,
+                           "label": int(trig)}
+                    for r in readouts:
+                        cos = cosine_distance(h_unc[r], h_crop[r])
+                        rl2 = relative_l2(h_unc[r], h_crop[r])
+                        scores[r]["cosine_distance"][cond].append(cos)
+                        scores[r]["relative_l2"][cond].append(rl2)
+                        rec[f"{r}_cosine_distance"] = cos
+                        rec[f"{r}_relative_l2"] = rl2
                     if trig:
                         survived.append(trigger_survives_crop(observation, args.trigger_size, args.crop_scale))
-                    episodes.append({"task_id": task_id, "init_index": episode_idx, "condition": cond,
-                                     "label": int(trig), "cosine_distance": cos, "relative_l2": rl2})
-                    print(f"    task={task_id} seed={episode_idx} {cond:8s} cos-dist={cos:.4f}", flush=True)
+                    episodes.append(rec)
+                    print(f"    task={task_id} seed={episode_idx} {cond:8s} "
+                          f"all-tok cos-dist={rec['all_tokens_cosine_distance']:.4f}", flush=True)
         finally:
             env.close()
 
@@ -243,19 +252,21 @@ def main():
         "attack": "badvla_white_patch", "checkpoint": args.checkpoint,
         "task_suite_name": args.task_suite_name, "crop_scale": args.crop_scale,
         "trigger_size": args.trigger_size, "trigger_position": "center",
-        "readout": "final LLM layer hidden states at action-token positions",
+        "readout": "final LLM layer hidden states over the ENTIRE sequence (all_tokens); action-token positions kept as a secondary readout",
         "polarity": "high = triggered",
         "eval_design": "disjoint init states between clean and trigger",
         "trigger_survives_crop_rate": float(np.mean(survived)) if survived else float("nan"),
     }
-    for m in ("cosine_distance", "relative_l2"):
-        c, t = scores[m]["clean"], scores[m]["trigger"]
-        auroc = compute_auroc_high_is_triggered(c, t)
-        results[m] = {"n_clean": len(c), "n_trigger": len(t), "auroc": auroc,
-                      "clean_mean": float(np.mean(c)) if c else float("nan"),
-                      "trigger_mean": float(np.mean(t)) if t else float("nan")}
-        print(f"[*] {m:16s}: n_clean={len(c)} n_trigger={len(t)} AUROC={auroc:.4f}  "
-              f"mean clean={results[m]['clean_mean']:.4f} trigger={results[m]['trigger_mean']:.4f}")
+    for r in readouts:
+        results[r] = {}
+        for m in ("cosine_distance", "relative_l2"):
+            c, t = scores[r][m]["clean"], scores[r][m]["trigger"]
+            auroc = compute_auroc_high_is_triggered(c, t)
+            results[r][m] = {"n_clean": len(c), "n_trigger": len(t), "auroc": auroc,
+                             "clean_mean": float(np.mean(c)) if c else float("nan"),
+                             "trigger_mean": float(np.mean(t)) if t else float("nan")}
+            print(f"[*] {r:14s} {m:16s}: n_clean={len(c)} n_trigger={len(t)} AUROC={auroc:.4f}  "
+                  f"mean clean={results[r][m]['clean_mean']:.4f} trigger={results[r][m]['trigger_mean']:.4f}")
     print(f"[*] white patch still present after the crop in "
           f"{results['trigger_survives_crop_rate']:.0%} of triggered frames")
     results["episodes"] = episodes
