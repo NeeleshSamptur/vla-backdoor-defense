@@ -7,3 +7,7 @@ __pycache__/
 results/*/attention_maps/
 results/*/hidden_states/
 results/*.log
+
+# scratch markers from progress monitors
+.*.done
+.*.err
