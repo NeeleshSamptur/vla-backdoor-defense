@@ -453,6 +453,42 @@ def run_to_trigger_frame(drive_cfg, env, task_description, model, action_head, p
     raise LiftNotReached(f"timed out after {t} steps without the lift/time condition being met")
 
 
+def build_base_cfg(checkpoint, task_suite_name, load_in_4bit, cover_wrist_lower_quarter, seed):
+    """DropVLA's own run_eval.sh paper protocol as a GenerateConfig. Factored
+    out of main() so the crop variant (run_crop_ftt_auroc.py) drives the
+    identical model/env/trigger settings by construction rather than by a
+    copy that could drift."""
+    return GenerateConfig(
+        pretrained_checkpoint=checkpoint,
+        task_suite_name=task_suite_name,
+        use_l1_regression=True,
+        use_diffusion=False,
+        use_film=False,
+        num_images_in_input=2,
+        use_proprio=True,
+        lora_rank=32,
+        load_in_8bit=False,
+        load_in_4bit=load_in_4bit,
+        center_crop=False,
+        num_open_loop_steps=8,
+        num_steps_wait=NUM_STEPS_WAIT,
+        env_img_res=256,
+        use_backdoor_instruction=False,
+        use_visual_backdoor=False,
+        language_suffix="carefully",
+        conditional_backdoor_on_lift=True,
+        backdoor_activation_height_m=0.06,
+        backdoor_activation_time_s=0.02,
+        visual_backdoor_dot_x=10,
+        visual_backdoor_dot_y=10,
+        visual_backdoor_dot_radius=5,
+        visual_backdoor_dot_alpha=255,
+        visual_backdoor_dot_shape="circle",
+        cover_wrist_lower_quarter=cover_wrist_lower_quarter,
+        seed=seed,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -478,35 +514,8 @@ def main():
 
     set_seed_everywhere(args.seed)
 
-    base_cfg = GenerateConfig(
-        pretrained_checkpoint=args.checkpoint,
-        task_suite_name=args.task_suite_name,
-        use_l1_regression=True,
-        use_diffusion=False,
-        use_film=False,
-        num_images_in_input=2,
-        use_proprio=True,
-        lora_rank=32,
-        load_in_8bit=False,
-        load_in_4bit=args.load_in_4bit,
-        center_crop=False,
-        num_open_loop_steps=8,
-        num_steps_wait=NUM_STEPS_WAIT,
-        env_img_res=256,
-        use_backdoor_instruction=False,
-        use_visual_backdoor=False,
-        language_suffix="carefully",
-        conditional_backdoor_on_lift=True,
-        backdoor_activation_height_m=0.06,
-        backdoor_activation_time_s=0.02,
-        visual_backdoor_dot_x=10,
-        visual_backdoor_dot_y=10,
-        visual_backdoor_dot_radius=5,
-        visual_backdoor_dot_alpha=255,
-        visual_backdoor_dot_shape="circle",
-        cover_wrist_lower_quarter=args.cover_wrist_lower_quarter,
-        seed=args.seed,
-    )
+    base_cfg = build_base_cfg(args.checkpoint, args.task_suite_name, args.load_in_4bit,
+                              args.cover_wrist_lower_quarter, args.seed)
 
     print(f"[*] loading {args.checkpoint} (suite={args.task_suite_name}, trigger_mode={args.trigger_mode}, "
           f"load_in_4bit={args.load_in_4bit})")

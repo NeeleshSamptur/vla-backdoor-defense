@@ -1,0 +1,12 @@
+{
+  "primary": {
+    "n_clean": 100,
+    "n_trigger": 100,
+    "auroc": 0.4064
+  },
+  "wrist": {
+    "n_clean": 100,
+    "n_trigger": 100,
+    "auroc": 0.4825000000000001
+  }
+}

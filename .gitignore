@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# Saved attention maps / activation blocks: ~390 MB per 100-episode run.
+# Every AUROC in results/*.json is recomputable from these, and the maps
+# themselves are regenerable by rerunning the script named in that JSON.
+results/*/attention_maps/
+results/*/hidden_states/
+results/*.log
