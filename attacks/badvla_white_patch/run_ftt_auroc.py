@@ -44,6 +44,15 @@ trusting SDPA's own is_causal=True instead) -- so attentions come back
 BIDIRECTIONAL, not causal. Loading with attn_implementation="eager" here
 avoids that silently-wrong path; it changes nothing about the model's
 predictions, only how attention is computed on the way out.
+
+Usage (BadVLA's own conda env -- confirmed via BadVLA/run_libero_eval_local.sh):
+    conda activate openvla-oft
+    cd /home/grads/nsamptur/vla_bkd_def/BadVLA
+
+    python /home/grads/nsamptur/vla_bkd_def/vla-backdoor-defense/attacks/badvla_white_patch/run_ftt_auroc.py \
+        --checkpoint <path to a BadVLA white-patch backdoored checkpoint> \
+        --task-suite-name libero_object \
+        --out ../vla-backdoor-defense/results/badvla_white_patch_ftt_auroc.json
 """
 from __future__ import annotations
 
