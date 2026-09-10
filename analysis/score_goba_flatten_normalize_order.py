@@ -1,26 +1,12 @@
 #!/usr/bin/env python
-"""Two orderings of the same 'flatten to one map' FTT construction on GoBA
-text2img attention, differing only in WHEN row-normalization happens
-relative to averaging the 32 layers together:
-
-  (1) normalize-then-average: row-normalize each layer's map separately
-      first, THEN average those 32 already-normalized maps into one map,
-      then run FTT on that one map (reference = its row-mean, distance =
-      its own rows to that reference).
-  (2) average-then-normalize: average the 32 RAW (un-normalized) maps into
-      one map first, THEN row-normalize that single combined map, then run
-      FTT on it the same way. (Reproduces
-      analysis/score_goba_layeraveraged_text2img_ftt.py's number exactly --
-      kept here side-by-side for direct comparison, not a re-derivation.)
-
-Both flatten to ONE map before scoring (unlike the 'shared reference,
-per-layer rows' construction explored separately) -- the only difference is
-normalization order, and because normalization (divide-by-row-sum) is
-nonlinear relative to averaging, the two orders are not equivalent.
+"""The 'flatten, normalize-then-average' FTT construction on GoBA text2img
+desc_only attention: row-normalize each of the 32 layers' maps separately,
+average those already-normalized maps into one map, then run FTT
+(Frobenius-norm distance from each row to the map's own row-mean) on that
+one map. Scored against AUROC.
 
 Reads results/goba_text2img_layerwise_causal_fixed/*.npz, role=='attack'
-only. New scoring file -- does not modify detectors/ftt.py or any other
-scoring script.
+only.
 """
 from __future__ import annotations
 
@@ -44,13 +30,6 @@ def score_normalize_then_average(layers: np.ndarray) -> float:
     normed = row_normalize(layers)   # [L, T, P] -- each row already sums to 1
     avg_map = normed.mean(axis=0)    # [T, P] -- average of already-normalized rows
     ref = avg_map.mean(axis=0)       # [P]
-    return float(np.linalg.norm(avg_map - ref[None, :], axis=1).mean())
-
-
-def score_average_then_normalize(layers: np.ndarray) -> float:
-    avg_map = layers.mean(axis=0)    # [T, P] -- average of RAW rows
-    avg_map = row_normalize(avg_map)
-    ref = avg_map.mean(axis=0)
     return float(np.linalg.norm(avg_map - ref[None, :], axis=1).mean())
 
 
@@ -84,9 +63,7 @@ def main():
     clean_63_keys = {(tid, seed) for tid, seed in balanced["chosen_clean_pairs"]}
     trig_63_keys = {(tid, seed) for tid, seed in balanced["trigger_pairs"]}
 
-    variants = ["normalize_then_average", "average_then_normalize"]
-    clean_100 = {v: {} for v in variants}
-    trig_100 = {v: {} for v in variants}
+    clean_100, trig_100 = {}, {}
 
     for fp in files:
         d = np.load(fp, allow_pickle=True)
@@ -96,23 +73,18 @@ def main():
         layers = d["attn_text_image_layers"].astype(np.float64)
         key = (meta["task_id"], meta["seed"])
         bucket = clean_100 if meta["label"] == 0 else trig_100
-        bucket["normalize_then_average"][key] = score_normalize_then_average(layers)
-        bucket["average_then_normalize"][key] = score_average_then_normalize(layers)
+        bucket[key] = score_normalize_then_average(layers)
 
-    for v in variants:
-        assert len(clean_100[v]) == 100 and len(trig_100[v]) == 100
+    assert len(clean_100) == 100 and len(trig_100) == 100
 
-    results = {}
-    print()
-    for v in variants:
-        c100 = list(clean_100[v].values())
-        t100 = list(trig_100[v].values())
-        c63 = [clean_100[v][k] for k in sorted(clean_63_keys)]
-        t63 = [trig_100[v][k] for k in sorted(trig_63_keys)]
-        auroc_100 = rank_auroc(c100, t100)
-        auroc_63 = rank_auroc(c63, t63)
-        results[v] = {"auroc_100v100": auroc_100, "auroc_63v63": auroc_63}
-        print(f"[*] {v:24s}  100v100={auroc_100:.4f}  63v63={auroc_63:.4f}")
+    c100 = list(clean_100.values())
+    t100 = list(trig_100.values())
+    c63 = [clean_100[k] for k in sorted(clean_63_keys)]
+    t63 = [trig_100[k] for k in sorted(trig_63_keys)]
+    auroc_100 = rank_auroc(c100, t100)
+    auroc_63 = rank_auroc(c63, t63)
+    results = {"normalize_then_average": {"auroc_100v100": auroc_100, "auroc_63v63": auroc_63}}
+    print(f"[*] normalize_then_average  100v100={auroc_100:.4f}  63v63={auroc_63:.4f}")
 
     out_path = REPO / "results" / "ftt_goba_text2img_flatten_normalize_order.json"
     with open(out_path, "w") as f:

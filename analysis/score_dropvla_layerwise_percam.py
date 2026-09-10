@@ -1,7 +1,10 @@
 #!/usr/bin/env python
-"""DropVLA equivalent of the GoBA report's sections 1-3: per-layer AUROC,
-Flatten method (2 orderings), Shared-reference method (2 orderings) -- run
-separately for the primary and wrist cameras.
+"""The 'flatten, normalize-then-average' FTT construction on DropVLA
+text2img desc_only attention: row-normalize each layer's map separately,
+average those already-normalized maps into one map, then run FTT
+(Frobenius-norm distance from each row to the map's own row-mean) on that
+one map. Scored against AUROC, run separately for the primary and wrist
+cameras.
 
 Reads results/dropvla_text2img_layerwise_percam/*.npz (written by the
 sibling extraction script
@@ -30,39 +33,10 @@ def ftt_on_rows(rows: np.ndarray) -> float:
     return float(np.linalg.norm(rows - ref[None, :], axis=1).mean())
 
 
-def per_layer_ftt(layers_raw: np.ndarray) -> np.ndarray:
-    """Standard per-layer FTT: each layer independently normalized and scored
-    against its own row-mean (same convention as section 1 for GoBA)."""
-    normed = row_normalize(layers_raw)
-    return np.array([ftt_on_rows(normed[l]) for l in range(normed.shape[0])])
-
-
 def flatten_normalize_then_average(layers_raw: np.ndarray) -> float:
     normed = row_normalize(layers_raw)
     avg_map = normed.mean(axis=0)
     return ftt_on_rows(avg_map)
-
-
-def flatten_average_then_normalize(layers_raw: np.ndarray) -> float:
-    avg_map = layers_raw.mean(axis=0)
-    avg_map = row_normalize(avg_map)
-    return ftt_on_rows(avg_map)
-
-
-def sharedref_normalize_then_average(layers_raw: np.ndarray) -> float:
-    P = row_normalize(layers_raw)
-    per_layer_mean = P.mean(axis=1)
-    ref = per_layer_mean.mean(axis=0)
-    per_token = np.linalg.norm(P - ref[None, None, :], axis=-1)
-    return float(per_token.mean(axis=1).mean())
-
-
-def sharedref_average_then_normalize(layers_raw: np.ndarray) -> float:
-    ref_raw = layers_raw.mean(axis=(0, 1))
-    ref = ref_raw / max(ref_raw.sum(), EPS)
-    P = row_normalize(layers_raw)
-    per_token = np.linalg.norm(P - ref[None, None, :], axis=-1)
-    return float(per_token.mean(axis=1).mean())
 
 
 def rank_auroc(clean_scores, trig_scores) -> float:
@@ -98,34 +72,13 @@ def score_camera(cam_key: str, files):
 
     n_clean, n_trig = len(clean_layers), len(trig_layers)
 
-    clean_pl = np.stack([per_layer_ftt(v) for v in clean_layers.values()])
-    trig_pl = np.stack([per_layer_ftt(v) for v in trig_layers.values()])
-    n_layers = clean_pl.shape[1]
-    auroc_per_layer = np.array([rank_auroc(clean_pl[:, l], trig_pl[:, l]) for l in range(n_layers)])
-    best_l = int(np.argmax(auroc_per_layer))
-
     c_na = [flatten_normalize_then_average(v) for v in clean_layers.values()]
     t_na = [flatten_normalize_then_average(v) for v in trig_layers.values()]
-    c_an = [flatten_average_then_normalize(v) for v in clean_layers.values()]
-    t_an = [flatten_average_then_normalize(v) for v in trig_layers.values()]
     auroc_flat_na = rank_auroc(c_na, t_na)
-    auroc_flat_an = rank_auroc(c_an, t_an)
-
-    c_sna = [sharedref_normalize_then_average(v) for v in clean_layers.values()]
-    t_sna = [sharedref_normalize_then_average(v) for v in trig_layers.values()]
-    c_san = [sharedref_average_then_normalize(v) for v in clean_layers.values()]
-    t_san = [sharedref_average_then_normalize(v) for v in trig_layers.values()]
-    auroc_shared_na = rank_auroc(c_sna, t_sna)
-    auroc_shared_an = rank_auroc(c_san, t_san)
 
     return {
-        "n_clean": n_clean, "n_trig": n_trig, "n_layers": n_layers,
-        "per_layer_auroc": auroc_per_layer.tolist(),
-        "best_layer": best_l, "best_layer_auroc": float(auroc_per_layer[best_l]),
+        "n_clean": n_clean, "n_trig": n_trig,
         "flatten_normalize_then_average": auroc_flat_na,
-        "flatten_average_then_normalize": auroc_flat_an,
-        "sharedref_normalize_then_average": auroc_shared_na,
-        "sharedref_average_then_normalize": auroc_shared_an,
     }
 
 
@@ -139,11 +92,7 @@ def main():
         result = score_camera(cam_key, files)
         out[label] = result
         print(f"    n_clean={result['n_clean']} n_trig={result['n_trig']}")
-        print(f"    best layer {result['best_layer']}: AUROC={result['best_layer_auroc']:.4f}")
         print(f"    Flatten, normalize-then-average: {result['flatten_normalize_then_average']:.4f}")
-        print(f"    Flatten, average-then-normalize: {result['flatten_average_then_normalize']:.4f}")
-        print(f"    Shared-ref, normalize-then-average: {result['sharedref_normalize_then_average']:.4f}")
-        print(f"    Shared-ref, average-then-normalize: {result['sharedref_average_then_normalize']:.4f}")
 
     out_path = REPO / "results" / "ftt_dropvla_text2img_layerwise_percam.json"
     with open(out_path, "w") as f:
