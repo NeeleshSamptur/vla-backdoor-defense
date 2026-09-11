@@ -103,12 +103,39 @@ def relative_l2(h0: np.ndarray, h1: np.ndarray) -> float:
     return float(np.linalg.norm(h1 - h0) / max(np.linalg.norm(h0), EPS))
 
 
+def apply_transform(img: np.ndarray, transform: str, crop_scale: float = 0.8) -> np.ndarray:
+    """Dispatch to one of the input transforms used by the crop-hidden
+    detector scripts, so --transform crop / grayscale share one call site."""
+    if transform == "crop":
+        return center_crop_resize(img, crop_scale)
+    if transform == "grayscale":
+        return grayscale_resize(img)
+    raise ValueError(f"unknown transform {transform!r}")
+
+
 def compute_auroc_high_is_triggered(clean_scores, trigger_scores) -> float:
     """AUROC for scores whose polarity is the OPPOSITE of FTT's: a HIGH score
     means triggered (e.g. an activation moves further when a transform deletes
     the trigger). Negates both classes and defers to compute_auroc so the
     metric itself is defined in exactly one place."""
     return compute_auroc([-s for s in clean_scores], [-s for s in trigger_scores])
+
+
+def grayscale_resize(img: np.ndarray) -> np.ndarray:
+    """Convert an HxWx3 uint8 image to grayscale, then replicate back to 3
+    channels so it can still be fed to a model expecting RGB. Same contract
+    as center_crop_resize: uint8 in, uint8 out, identical shape.
+
+    Unlike a crop (which only removes a trigger if it happens to sit near an
+    edge), this destroys the trigger's COLOR wherever it is in the frame --
+    a position-independent probe. ITU-R BT.601 luma weights (0.299/0.587/0.114),
+    matching PIL's "L" conversion.
+    """
+    if img.dtype != np.uint8 or img.ndim != 3 or img.shape[-1] != 3:
+        raise ValueError(f"expected uint8 HxWx3 image, got {img.shape}/{img.dtype}")
+    gray = (img[..., 0] * 0.299 + img[..., 1] * 0.587 + img[..., 2] * 0.114)
+    gray = np.clip(gray, 0, 255).astype(np.uint8)
+    return np.stack([gray, gray, gray], axis=-1)
 
 
 def compute_auroc(clean_scores, trigger_scores) -> float:

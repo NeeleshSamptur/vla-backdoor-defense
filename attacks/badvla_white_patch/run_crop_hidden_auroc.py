@@ -80,7 +80,7 @@ from attacks.badvla_white_patch.run_ftt_auroc import (
     VALID_SUITES,
     load_model,
 )
-from attacks.common import center_crop_resize, compute_auroc_high_is_triggered, cosine_distance, relative_l2
+from attacks.common import apply_transform, compute_auroc_high_is_triggered, cosine_distance, relative_l2
 
 from prismatic.vla.constants import ACTION_DIM, IGNORE_INDEX, NUM_ACTIONS_CHUNK
 
@@ -91,7 +91,7 @@ from experiments.robot.robot_utils import get_image_resize_size
 
 
 def capture_last_layer_activations(vla, processor, proprio_projector, cfg, observation, desc,
-                                   trigger: bool, trigger_size: float, crop_scale=None):
+                                   trigger: bool, trigger_size: float, transform=None, crop_scale=0.8):
     """{"all_tokens": [T, d_model], "action_tokens": [56, d_model]} final-layer
     hidden states from one forward pass.
 
@@ -106,9 +106,9 @@ def capture_last_layer_activations(vla, processor, proprio_projector, cfg, obser
     if trigger:
         full = add_trigger_img(full, trigger_size=trigger_size, trigger_position="center", trigger_color=255)
         wrist = add_trigger_img(wrist, trigger_size=trigger_size, trigger_position="center", trigger_color=255)
-    if crop_scale is not None:
-        full = center_crop_resize(full, crop_scale)
-        wrist = center_crop_resize(wrist, crop_scale)
+    if transform is not None:
+        full = apply_transform(full, transform, crop_scale)
+        wrist = apply_transform(wrist, transform, crop_scale)
     primary_img, wrist_img = prepare_images_for_vla([full, wrist], cfg)
 
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
@@ -163,14 +163,14 @@ def capture_last_layer_activations(vla, processor, proprio_projector, cfg, obser
     return {"all_tokens": hidden_all, "action_tokens": hidden_all[start:end]}
 
 
-def trigger_survives_crop(observation, trigger_size: float, crop_scale: float) -> bool:
+def trigger_survives_crop(observation, trigger_size: float, crop_scale: float, transform: str = "crop") -> bool:
     """Diagnostic, NOT part of the score: does the white patch still cover the
     centre of the frame after cropping? Compares the mean brightness of the
     central patch-sized window before and after the crop; the patch is drawn
     at colour 255, so if it survives, that window stays saturated."""
     full = add_trigger_img(observation["full_image"].copy(), trigger_size=trigger_size,
                            trigger_position="center", trigger_color=255)
-    cropped = center_crop_resize(full, crop_scale)
+    cropped = apply_transform(full, transform, crop_scale)
     h, w = cropped.shape[:2]
     half = max(int(min(h, w) * trigger_size / 2), 1)
     window = cropped[h // 2 - half:h // 2 + half, w // 2 - half:w // 2 + half]
@@ -183,6 +183,7 @@ def main():
     ap.add_argument("--task-suite-name", required=True, choices=VALID_SUITES)
     ap.add_argument("--out", required=True)
     ap.add_argument("--crop-scale", type=float, default=0.8)
+    ap.add_argument("--transform", choices=["crop", "grayscale"], default="crop")
     ap.add_argument("--n-tasks", type=int, default=10)
     ap.add_argument("--n-seeds", type=int, default=10)
     ap.add_argument("--seed", type=int, default=7, help="base curated-init-state index")
@@ -223,10 +224,10 @@ def main():
 
                     h_unc = capture_last_layer_activations(
                         vla, processor, proprio_projector, cfg, observation, desc, trig,
-                        args.trigger_size, crop_scale=None)
+                        args.trigger_size, transform=None)
                     h_crop = capture_last_layer_activations(
                         vla, processor, proprio_projector, cfg, observation, desc, trig,
-                        args.trigger_size, crop_scale=args.crop_scale)
+                        args.trigger_size, transform=args.transform, crop_scale=args.crop_scale)
 
                     rec = {"task_id": task_id, "init_index": episode_idx, "condition": cond,
                            "label": int(trig)}
@@ -238,7 +239,7 @@ def main():
                         rec[f"{r}_cosine_distance"] = cos
                         rec[f"{r}_relative_l2"] = rl2
                     if trig:
-                        survived.append(trigger_survives_crop(observation, args.trigger_size, args.crop_scale))
+                        survived.append(trigger_survives_crop(observation, args.trigger_size, args.crop_scale, args.transform))
                     episodes.append(rec)
                     print(f"    task={task_id} seed={episode_idx} {cond:8s} "
                           f"all-tok cos-dist={rec['all_tokens_cosine_distance']:.4f}", flush=True)
@@ -251,7 +252,7 @@ def main():
     results = {
         "attack": "badvla_white_patch", "checkpoint": args.checkpoint,
         "task_suite_name": args.task_suite_name, "crop_scale": args.crop_scale,
-        "trigger_size": args.trigger_size, "trigger_position": "center",
+        "transform": args.transform, "trigger_size": args.trigger_size, "trigger_position": "center",
         "readout": "final LLM layer hidden states over the ENTIRE sequence (all_tokens); action-token positions kept as a secondary readout",
         "polarity": "high = triggered",
         "eval_design": "disjoint init states between clean and trigger",

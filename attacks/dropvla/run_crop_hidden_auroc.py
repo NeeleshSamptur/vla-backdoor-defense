@@ -112,7 +112,7 @@ from attacks.dropvla.run_ftt_auroc import (
 )
 from prismatic.vla.constants import ACTION_DIM, IGNORE_INDEX, NUM_ACTIONS_CHUNK
 from attacks.dropvla.run_crop_ftt_auroc import crop_observation
-from attacks.common import (center_crop_resize, compute_auroc_high_is_triggered,
+from attacks.common import (apply_transform, compute_auroc_high_is_triggered,
                             cosine_distance, relative_l2)
 
 from experiments.robot.libero.libero_utils import get_libero_env
@@ -125,7 +125,7 @@ GRIPPER_DIM = 6  # LIBERO action layout: [dx, dy, dz, droll, dpitch, dyaw, gripp
 
 @torch.inference_mode()
 def capture_last_layer_activations(vla, processor, action_head, proprio_projector, cfg,
-                                   observation, desc, crop_scale=None):
+                                   observation, desc, transform=None, crop_scale=0.8):
     """Final-layer hidden states for the WHOLE sequence.
 
     Returns {"all_tokens": [T, d_model], "action_tokens": [56, d_model]}.
@@ -149,9 +149,9 @@ def capture_last_layer_activations(vla, processor, action_head, proprio_projecto
     """
     full = observation["full_image"]
     wrist = observation["wrist_image"]
-    if crop_scale is not None:
-        full = center_crop_resize(full, crop_scale)
-        wrist = center_crop_resize(wrist, crop_scale)
+    if transform is not None:
+        full = apply_transform(full, transform, crop_scale)
+        wrist = apply_transform(wrist, transform, crop_scale)
     images = prepare_images_for_vla([full, wrist], cfg)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
     inputs = processor(prompt, images[0]).to(DEVICE, dtype=torch.bfloat16)
@@ -207,6 +207,7 @@ def main():
     ap.add_argument("--out", required=True, help="path to write the results JSON to.")
     ap.add_argument("--crop-scale", type=float, default=0.8,
                     help="linear fraction kept by the center crop (0.8 removes DropVLA's dot).")
+    ap.add_argument("--transform", choices=["crop", "grayscale"], default="crop")
     ap.add_argument("--hidden-states-dir", default=None,
                     help="optional directory for the raw [56, 4096] activation blocks (float16), "
                          "one .npz per (episode, condition) holding the uncropped and cropped "
@@ -278,10 +279,10 @@ def main():
                 for cond, (observation, desc) in observations.items():
                     h_unc = capture_last_layer_activations(
                         model, processor, action_head, proprio_projector, base_cfg,
-                        observation, desc, crop_scale=None)
+                        observation, desc, transform=None)
                     h_crop = capture_last_layer_activations(
                         model, processor, action_head, proprio_projector, base_cfg,
-                        observation, desc, crop_scale=args.crop_scale)
+                        observation, desc, transform=args.transform, crop_scale=args.crop_scale)
 
                     per_episode = {}
                     for r in readouts:
@@ -303,7 +304,7 @@ def main():
                                 "task_suite_name": args.task_suite_name, "task_id": task_id,
                                 "init_index": episode_idx, "frame_idx": t, "condition": cond,
                                 "label": int(cond == "trigger"), "trigger_mode": args.trigger_mode,
-                                "crop_scale": args.crop_scale, "task_description": task_description,
+                                "crop_scale": args.crop_scale, "transform": args.transform, "task_description": task_description,
                                 "readout": "final LLM layer over the entire sequence",
                                 "scores": per_episode,
                             }))
@@ -320,7 +321,7 @@ def main():
     results = {
         "attack": "dropvla", "checkpoint": args.checkpoint,
         "task_suite_name": args.task_suite_name, "trigger_mode": args.trigger_mode,
-        "crop_scale": args.crop_scale, "seed": args.seed,
+        "crop_scale": args.crop_scale, "transform": args.transform, "seed": args.seed,
         "readout": "final LLM layer hidden states over the ENTIRE sequence (all_tokens); action-token positions kept as a secondary readout",
         "n_episodes": len(episodes),
         "polarity": {"cosine_distance": "high = triggered",

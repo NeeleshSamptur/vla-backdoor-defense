@@ -90,14 +90,14 @@ from attacks.goba.run_ftt_auroc import (
     load_model,
     preprocess_frame,
 )
-from attacks.common import center_crop_resize, compute_auroc_high_is_triggered, cosine_distance, relative_l2
+from attacks.common import apply_transform, compute_auroc_high_is_triggered, cosine_distance, relative_l2
 
 from experiments.robot.libero.libero_utils import get_libero_dummy_action, get_libero_env
 from experiments.robot.openvla_utils import get_processor
 from experiments.robot.robot_utils import get_image_resize_size, set_seed_everywhere
 
 
-def capture_last_layer_activations(vla, processor, image, desc, center_crop=True, crop_scale=None):
+def capture_last_layer_activations(vla, processor, image, desc, center_crop=True, transform=None, crop_scale=0.8):
     """(all_tokens, final_position, desc_tokens) final-layer hidden states.
 
     all_tokens is the primary readout: EVERY position of the sequence (BOS,
@@ -109,8 +109,8 @@ def capture_last_layer_activations(vla, processor, image, desc, center_crop=True
     output_hidden_states in place of output_attentions. `crop_scale`, if
     given, center-crops the frame BEFORE GoBA's own preprocessing crop.
     """
-    if crop_scale is not None:
-        image = center_crop_resize(image, crop_scale)
+    if transform is not None:
+        image = apply_transform(image, transform, crop_scale)
     img = preprocess_frame(image, center_crop)
     prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
     inputs = processor(prompt, img).to(DEVICE, dtype=torch.bfloat16)
@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--task-suite-name", required=True, choices=VALID_SUITES)
     ap.add_argument("--out", required=True)
     ap.add_argument("--crop-scale", type=float, default=0.8)
+    ap.add_argument("--transform", choices=["crop", "grayscale"], default="crop")
     ap.add_argument("--n-tasks", type=int, default=10)
     ap.add_argument("--n-seeds", type=int, default=10)
     ap.add_argument("--seed", type=int, default=7)
@@ -200,10 +201,10 @@ def main():
                     _, img = build_observation(obs, resize_size)
 
                     unc = capture_last_layer_activations(vla, processor, img, desc,
-                                                         center_crop=cfg.center_crop, crop_scale=None)
+                                                         center_crop=cfg.center_crop, transform=None)
                     crp = capture_last_layer_activations(vla, processor, img, desc,
                                                          center_crop=cfg.center_crop,
-                                                         crop_scale=args.crop_scale)
+                                                         transform=args.transform, crop_scale=args.crop_scale)
                     ep_idx = cond_offset[cond] + ep
                     rec = {"task_id": task_id, "seed": ep_idx, "condition": cond,
                            "label": int(cond == "trigger")}
@@ -227,7 +228,7 @@ def main():
     results = {
         "attack": "goba", "checkpoint": args.checkpoint,
         "task_suite_name": args.task_suite_name, "crop_scale": args.crop_scale,
-        "eval_design": args.eval_design,
+        "transform": args.transform, "eval_design": args.eval_design,
         "trigger": "physical toxic box placed in the scene by a poisoned BDDL",
         "readout": "final LLM layer over the ENTIRE sequence (all_tokens, primary); base "
                    "OpenVLA has no action-token positions (see module docstring), so "
